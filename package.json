@@ -21,7 +21,7 @@
     "@lancedb/lancedb-linux-x64-gnu": "^0.27.2",
     "@libsql/client": "^0.15.15",
     "@libsql/linux-x64-gnu": "^0.5.29",
-    "baileys": "^6.7.19",
+    "baileys": "6.7.21",
     "drizzle-orm": "^0.45.1",
     "groq-sdk": "^0.33.0",
     "hono": "^4.10.6",
