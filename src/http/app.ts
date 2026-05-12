@@ -1066,6 +1066,405 @@ function landingPageHtml(): string {
 
     loadAppointments();
   </script>
+
+  <!-- ╔══════════════════════════════════════════════════════════════╗
+       ║        FLOATING CHATBOT WIDGET (BOTTOM-RIGHT POPUP)        ║
+       ╚══════════════════════════════════════════════════════════════╝ -->
+  <style>
+    /* ─── LAUNCHER BUTTON ───────────────────────────────────────────────── */
+    #cw-launcher {
+      position:fixed;bottom:24px;right:24px;z-index:9999;
+      width:60px;height:60px;border-radius:50%;
+      background:linear-gradient(135deg,#6366f1,#8b5cf6);
+      border:none;cursor:pointer;
+      display:flex;align-items:center;justify-content:center;
+      box-shadow:0 6px 28px rgba(99,102,241,.55);transition:transform .2s;
+    }
+    #cw-launcher:hover{transform:scale(1.1)}
+    #cw-launcher svg{width:26px;height:26px;fill:#fff;transition:opacity .2s}
+    #cw-launcher .cw-icon-close{display:none}
+    #cw-launcher.open .cw-icon-chat{display:none}
+    #cw-launcher.open .cw-icon-close{display:block}
+    /* notification badge */
+    #cw-badge{
+      position:absolute;top:-3px;right:-3px;
+      width:20px;height:20px;border-radius:50%;
+      background:#ef4444;color:#fff;font-size:11px;font-weight:700;
+      display:flex;align-items:center;justify-content:center;
+      border:2px solid var(--bg);animation:cwPulse 2s infinite;
+    }
+    @keyframes cwPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
+
+    /* ─── CHAT PANEL ───────────────────────────────────────────────────── */
+    #cw-panel{
+      position:fixed;bottom:96px;right:24px;z-index:9998;
+      width:390px;height:580px;
+      background:#1a1d2e;border-radius:20px;
+      box-shadow:0 24px 80px rgba(0,0,0,.7),0 0 0 1px rgba(99,102,241,.2);
+      display:flex;flex-direction:column;overflow:hidden;
+      transform:translateY(20px) scale(.95);opacity:0;
+      pointer-events:none;transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;
+    }
+    #cw-panel.open{transform:translateY(0) scale(1);opacity:1;pointer-events:all}
+    @media(max-width:480px){
+      #cw-panel{right:0;bottom:0;width:100%;height:100dvh;border-radius:0}
+      #cw-launcher{bottom:16px;right:16px}
+    }
+
+    /* Header */
+    #cw-panel .cp-hdr{
+      background:linear-gradient(175deg,#2e2a55,#1e1b40);
+      padding:14px 16px;display:flex;align-items:center;gap:11px;
+      flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.06);
+    }
+    .cp-av{
+      width:44px;height:44px;border-radius:12px;flex-shrink:0;
+      background:linear-gradient(135deg,#8b5cf6,#6366f1,#3b82f6);
+      display:flex;align-items:center;justify-content:center;
+      font-size:22px;box-shadow:0 3px 12px rgba(99,102,241,.4);
+    }
+    .cp-nm{color:#fff;font-size:15px;font-weight:700}
+    .cp-st{display:flex;align-items:center;gap:5px;margin-top:2px}
+    .cp-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e}
+    .cp-stxt{font-size:12px;color:#22c55e;font-weight:500}
+    .cp-hdr-btns{margin-left:auto;display:flex;gap:6px}
+    .cp-hbtn{
+      width:30px;height:30px;border:none;border-radius:8px;
+      background:rgba(255,255,255,.08);color:rgba(255,255,255,.6);
+      cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;
+      transition:background .15s;
+    }
+    .cp-hbtn:hover{background:rgba(255,255,255,.16);color:#fff}
+
+    /* Messages */
+    #cw-msgs{
+      flex:1;overflow-y:auto;padding:14px 14px 6px;
+      display:flex;flex-direction:column;gap:2px;
+      scrollbar-width:thin;scrollbar-color:rgba(99,102,241,.2) transparent;
+    }
+    #cw-msgs::-webkit-scrollbar{width:3px}
+    #cw-msgs::-webkit-scrollbar-thumb{background:rgba(99,102,241,.25);border-radius:2px}
+    .cw-row{display:flex;flex-direction:column;margin-bottom:2px}
+    .cw-row.bot{align-items:flex-start}.cw-row.usr{align-items:flex-end}
+    .cw-bbl{max-width:82%;padding:11px 15px;font-size:13.5px;line-height:1.55;word-break:break-word}
+    .cw-bbl.bot{background:#252a42;color:#dde1f0;border-radius:18px 18px 18px 5px}
+    .cw-bbl.usr{background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border-radius:18px 18px 5px 18px}
+    .cw-bbl.sys{background:rgba(255,255,255,.04);color:rgba(255,255,255,.35);font-size:11px;border-radius:8px;text-align:center;max-width:100%;padding:5px 10px}
+    .cw-time{font-size:10px;color:rgba(255,255,255,.22);margin-top:3px;padding:0 3px}
+    /* Booking card */
+    .cw-card{max-width:82%;border:1px solid rgba(34,197,94,.22);border-radius:14px;overflow:hidden;background:rgba(34,197,94,.06)}
+    .cw-card-hd{background:rgba(34,197,94,.14);padding:7px 13px;font-size:11px;font-weight:700;color:#4ade80;letter-spacing:.05em}
+    .cw-card-bd{padding:10px 13px;font-size:13px;color:#dde1f0;line-height:1.5}
+    .cw-card-id{padding:2px 13px 8px;font-size:10px;color:rgba(255,255,255,.2)}
+    /* Typing */
+    .cw-typing-row{display:flex}
+    .cw-tbbl{background:#252a42;border-radius:18px 18px 18px 5px;padding:12px 15px;display:inline-flex;gap:5px;align-items:center}
+    .cw-td{width:6px;height:6px;background:#6366f1;border-radius:50%;animation:cwTd 1.2s ease-in-out infinite both}
+    .cw-td:nth-child(2){animation-delay:.2s}.cw-td:nth-child(3){animation-delay:.4s}
+    @keyframes cwTd{0%,60%,100%{transform:translateY(0);opacity:.3}30%{transform:translateY(-7px);opacity:1}}
+    /* Handoff */
+    .cw-handoff{border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.07);color:#fbbf24;border-radius:10px;padding:7px 12px;font-size:12px;text-align:center}
+    /* Day sep */
+    .cw-daysep{text-align:center;padding:8px 0}
+    .cw-daysep span{font-size:11px;color:rgba(255,255,255,.18);background:rgba(255,255,255,.04);padding:3px 10px;border-radius:8px}
+
+    /* Suggestions */
+    #cw-sugg{display:none;flex-wrap:wrap;gap:7px;padding:10px 14px;flex-shrink:0}
+    .cw-chip{
+      border:1px solid rgba(99,102,241,.32);background:rgba(99,102,241,.07);
+      color:#a5b4fc;border-radius:20px;padding:6px 14px;font-size:12.5px;
+      cursor:pointer;font-family:inherit;transition:all .15s;line-height:1.3;
+    }
+    .cw-chip:hover{background:rgba(99,102,241,.2);border-color:#6366f1;color:#fff}
+
+    /* Input */
+    #cw-panel .cp-ibar{padding:10px 14px 14px;flex-shrink:0}
+    .cp-iwrap{
+      display:flex;align-items:center;background:#252a42;
+      border-radius:26px;border:1.5px solid rgba(99,102,241,.15);
+      padding:5px 5px 5px 16px;gap:8px;transition:border-color .2s;
+    }
+    .cp-iwrap:focus-within{border-color:rgba(99,102,241,.55);box-shadow:0 0 0 3px rgba(99,102,241,.07)}
+    #cw-inp{
+      flex:1;background:transparent;border:none;color:#dde1f0;
+      font-size:14px;font-family:inherit;outline:none;resize:none;
+      max-height:90px;line-height:1.5;padding:5px 0;
+    }
+    #cw-inp::placeholder{color:rgba(255,255,255,.25)}
+    #cw-send{
+      width:38px;height:38px;border-radius:50%;
+      background:linear-gradient(135deg,#6366f1,#8b5cf6);
+      border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;
+      flex-shrink:0;box-shadow:0 3px 10px rgba(99,102,241,.4);
+      transition:transform .15s,opacity .15s;
+    }
+    #cw-send:hover{transform:scale(1.08)}
+    #cw-send:disabled{opacity:.4;cursor:not-allowed;transform:none}
+    #cw-send svg{width:16px;height:16px;fill:#fff}
+  </style>
+
+  <!-- Launcher button -->
+  <button id="cw-launcher" onclick="cwToggle()" aria-label="Open chat">
+    <svg class="cw-icon-chat" viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z"/></svg>
+    <svg class="cw-icon-close" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+    <span id="cw-badge">1</span>
+  </button>
+
+  <!-- Chat panel -->
+  <div id="cw-panel" role="dialog" aria-label="Demo Clinic AI Chat">
+    <!-- Header -->
+    <div class="cp-hdr">
+      <div class="cp-av">🏥</div>
+      <div style="flex:1;min-width:0">
+        <div class="cp-nm">Demo Clinic AI</div>
+        <div class="cp-st"><span class="cp-dot" id="cw-dot"></span><span class="cp-stxt" id="cw-stxt">Online</span></div>
+      </div>
+      <div class="cp-hdr-btns">
+        <button class="cp-hbtn" onclick="cwClear()" title="Clear chat">&#128465;</button>
+        <button class="cp-hbtn" onclick="cwNewUser()" title="New user">🔄</button>
+        <button class="cp-hbtn" onclick="cwToggle()" title="Close">✕</button>
+      </div>
+    </div>
+    <!-- Messages -->
+    <div id="cw-msgs"></div>
+    <!-- Suggestions -->
+    <div id="cw-sugg"></div>
+    <!-- Input -->
+    <div class="cp-ibar">
+      <div class="cp-iwrap">
+        <textarea id="cw-inp" rows="1" placeholder="Ask me anything..." onkeydown="cwKey(event)" oninput="cwGrow(this)"></textarea>
+        <button id="cw-send" onclick="cwSend()" title="Send">
+          <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function(){
+    /* ─ CONFIG ────────────────────────────────────────────── */
+    var from = 'web_' + (localStorage.getItem('cw_from') || (Date.now().toString(36)));
+    localStorage.setItem('cw_from', from.replace('web_',''));
+    var userName = '';
+    var isOpen = false;
+    var isSending = false;
+    var abortCtrl = null;
+    var lastSendTime = 0;
+    var msgStore = [];
+    var SK = 'cw_msgs_v1_' + from;
+    var hasUnread = true;
+    var SUGGESTIONS = [
+      '👋 Hi! I need help',
+      '🗓\ufe0f Book an appointment',
+      '💰 Consultation fees',
+      '🧑\u200d⚕\ufe0f Services offered',
+      '📍 Clinic location',
+      '⏰ Opening hours',
+      '📝 My appointments',
+      '❌ Cancel appointment'
+    ];
+    var WELCOME = 'Good day! \ud83d\udc4b Welcome to **Demo Clinic AI**. I can help you with:\n\n\u2022 Book & manage appointments\n\u2022 Services & consultation fees\n\u2022 Doctors & clinic information\n\u2022 Opening hours & location\n\nHow can I assist you today?';
+
+    /* ─ HELPERS ──────────────────────────────────────── */
+    function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+    function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');}
+    function scrollEnd(){var m=document.getElementById('cw-msgs');m.scrollTop=m.scrollHeight;}
+    function cwGrow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,90)+'px';}
+    function cwKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();cwSend();}}
+    function saveSK(){try{localStorage.setItem(SK,JSON.stringify(msgStore.slice(-80)));}catch(e){}}
+    function loadSK(){try{var s=localStorage.getItem(SK);if(s)msgStore=JSON.parse(s);}catch(e){msgStore=[];}}
+
+    /* ─ HEALTH POLL ────────────────────────────────────── */
+    function pollHealth(){
+      fetch('/health').then(function(r){return r.json();}).then(function(d){
+        var dot=document.getElementById('cw-dot'),txt=document.getElementById('cw-stxt');
+        if(!dot)return;
+        var ok=d.whatsappReady;
+        txt.textContent=ok?'Online':'AI Mode';
+        txt.style.color=ok?'#22c55e':'#f59e0b';
+        dot.style.background=ok?'#22c55e':'#f59e0b';
+        dot.style.boxShadow='0 0 6px '+(ok?'#22c55e':'#f59e0b');
+      }).catch(function(){});
+    }
+    pollHealth();
+    setInterval(pollHealth,30000);
+
+    /* ─ TOGGLE ──────────────────────────────────────────── */
+    window.cwToggle=function(){
+      isOpen=!isOpen;
+      document.getElementById('cw-panel').classList.toggle('open',isOpen);
+      document.getElementById('cw-launcher').classList.toggle('open',isOpen);
+      if(isOpen){
+        document.getElementById('cw-badge').style.display='none';
+        hasUnread=false;
+        if(msgStore.length===0) cwInit();
+        setTimeout(function(){document.getElementById('cw-inp').focus();},260);
+      }
+    };
+
+    /* ─ INIT (first open) ─────────────────────────────────── */
+    function cwInit(){
+      loadSK();
+      var msgs=document.getElementById('cw-msgs');
+      msgs.innerHTML='<div class="cw-daysep"><span>Today</span></div>';
+      if(msgStore.length===0){
+        // Welcome message with typing delay for realism
+        cwShowTyping();
+        setTimeout(function(){
+          cwRemoveTyping();
+          cwRender('bot',WELCOME,'',now(),false);
+          cwShowSugg();
+        },900);
+      } else {
+        msgStore.forEach(function(m){cwRender(m.r,m.t,m.e||'',m.ts,false);});
+        cwHideSugg();
+      }
+      scrollEnd();
+    }
+
+    /* ─ RENDER MESSAGES ──────────────────────────────────── */
+    function cwRender(role,text,extra,time,save){
+      var el=document.getElementById('cw-msgs');
+      var row=document.createElement('div');
+      row.className='cw-row '+(role==='usr'?'usr':'bot');
+      if(role==='sys'){
+        row.innerHTML='<div class="cw-bbl sys">'+esc(text)+'</div>';
+      } else {
+        row.innerHTML='<div class="cw-bbl '+role+'">'+esc(text)+'</div>'
+          +'<div class="cw-time">'+(time||now())+'</div>';
+      }
+      el.appendChild(row);
+      if(save&&role!=='sys'){
+        msgStore.push({r:role,t:text,e:extra||'',ts:time||now()});
+        saveSK();
+      }
+      scrollEnd();
+    }
+    function cwAddBubble(r,t){cwRender(r,t,'',now(),true);}
+
+    function cwBookingCard(text,meta){
+      var el=document.getElementById('cw-msgs');
+      var row=document.createElement('div');
+      row.className='cw-row bot';
+      row.innerHTML='<div class="cw-card">'
+        +'<div class="cw-card-hd">✅ APPOINTMENT CONFIRMED</div>'
+        +'<div class="cw-card-bd">'+esc(text)+'</div>'
+        +(meta&&meta.appointmentId?'<div class="cw-card-id">ID: '+String(meta.appointmentId)+'</div>':'')
+        +'</div><div class="cw-time">'+now()+'</div>';
+      el.appendChild(row);
+      msgStore.push({r:'bot',t:text,e:'',ts:now()});
+      saveSK();scrollEnd();
+    }
+
+    /* ─ TYPING INDICATOR ──────────────────────────────────── */
+    function cwShowTyping(){
+      if(document.getElementById('cw-typing'))return;
+      var el=document.getElementById('cw-msgs');
+      var row=document.createElement('div');
+      row.className='cw-typing-row';row.id='cw-typing';
+      row.innerHTML='<div class="cw-tbbl"><div class="cw-td"></div><div class="cw-td"></div><div class="cw-td"></div></div>';
+      el.appendChild(row);scrollEnd();
+    }
+    function cwRemoveTyping(){var t=document.getElementById('cw-typing');if(t)t.remove();}
+
+    /* ─ SUGGESTIONS ────────────────────────────────────────── */
+    function cwShowSugg(){
+      var el=document.getElementById('cw-sugg');
+      el.innerHTML=SUGGESTIONS.map(function(s){
+        return '<button class="cw-chip" onclick="cwUseSugg(this.textContent)">'+s+'</button>';
+      }).join('');
+      el.style.display='flex';
+    }
+    function cwHideSugg(){document.getElementById('cw-sugg').style.display='none';}
+    window.cwUseSugg=function(t){
+      document.getElementById('cw-inp').value=t;
+      cwHideSugg();cwSend();
+    };
+
+    /* ─ CLEAR / NEW USER ────────────────────────────────────── */
+    window.cwClear=function(){
+      if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
+      isSending=false;cwRemoveTyping();
+      document.getElementById('cw-send').disabled=false;
+      msgStore=[];saveSK();
+      var msgs=document.getElementById('cw-msgs');
+      msgs.innerHTML='<div class="cw-daysep"><span>Today</span></div>';
+      cwRender('bot','Chat cleared! How can I help you today? \ud83d\ude0a','',now(),false);
+      cwShowSugg();
+    };
+    window.cwNewUser=function(){
+      if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
+      isSending=false;cwRemoveTyping();
+      from='web_'+Date.now().toString(36);
+      localStorage.setItem('cw_from',from.replace('web_',''));
+      userName='';
+      msgStore=[];
+      var msgs=document.getElementById('cw-msgs');
+      msgs.innerHTML='<div class="cw-daysep"><span>Today</span></div>';
+      cwShowTyping();
+      setTimeout(function(){
+        cwRemoveTyping();
+        cwRender('bot',WELCOME,'',now(),false);
+        cwShowSugg();
+      },800);
+    };
+
+    /* ─ SEND ───────────────────────────────────────────────── */
+    window.cwSend=async function(){
+      if(isSending)return;
+      var text=document.getElementById('cw-inp').value.trim();
+      if(!text)return;
+      // min gap to avoid rate-limit spike
+      var gap=Date.now()-lastSendTime;
+      if(gap<600)await new Promise(function(r){setTimeout(r,600-gap);});
+      isSending=true;lastSendTime=Date.now();
+      var btn=document.getElementById('cw-send');
+      btn.disabled=true;
+      cwHideSugg();
+      cwAddBubble('usr',text);
+      document.getElementById('cw-inp').value='';
+      document.getElementById('cw-inp').style.height='auto';
+      cwShowTyping();
+      abortCtrl=new AbortController();
+      try{
+        var r=await fetch('/chat/test',{
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body:JSON.stringify({from:from,name:userName||undefined,text:text}),
+          signal:abortCtrl.signal
+        });
+        abortCtrl=null;
+        cwRemoveTyping();
+        if(r.status===429){
+          cwAddBubble('sys','⚠️ Too many messages. Please wait a moment.');
+          setTimeout(function(){isSending=false;btn.disabled=false;},5000);
+          return;
+        }
+        var d=await r.json();
+        if(d.metadata&&d.metadata.booked&&d.text)cwBookingCard(d.text,d.metadata);
+        else if(d.text)cwAddBubble('bot',d.text);
+        if(d.handoff){
+          var hb=document.createElement('div');
+          hb.className='cw-handoff';hb.textContent='🔁 Connecting you to a human agent...';
+          document.getElementById('cw-msgs').appendChild(hb);scrollEnd();
+        }
+      }catch(e){
+        cwRemoveTyping();
+        if(e.name!=='AbortError')cwAddBubble('sys','⚠️ Connection error. Please retry.');
+      }
+      isSending=false;btn.disabled=false;
+      document.getElementById('cw-inp').focus();
+    };
+
+    // Auto-open after 3 seconds on first visit to grab attention
+    if(!localStorage.getItem('cw_visited')){
+      setTimeout(function(){
+        if(!isOpen)cwToggle();
+        localStorage.setItem('cw_visited','1');
+      },3000);
+    }
+  })();
+  </script>
 </body>
 </html>`;
 }
