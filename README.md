@@ -89,17 +89,20 @@ Send these from an admin WhatsApp number:
 
 ## Deployment
 
-Create a Fly app, volume, and secrets:
+Create a Fly app and secrets:
 
 ```bash
 fly apps create whatsapp-ai-chatbot
-fly volumes create chatbot_data --size 3 --region sin
 fly secrets set GROQ_API_KEY=... TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=...
 copy fly.example.toml fly.toml
 fly deploy
 ```
 
-Keep `min_machines_running = 1` because WhatsApp WebSocket sessions should stay warm.
+If you need persistent WhatsApp auth/database files, use `fly.example.toml` and create a volume first:
+
+```bash
+fly volumes create chatbot_data --size 3 --region <region>
+```
 
 ## Swap-In Points
 

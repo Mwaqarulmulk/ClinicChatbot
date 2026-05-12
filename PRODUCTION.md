@@ -64,8 +64,6 @@ fly auth login
 # Create the app (if not already created)
 fly apps create clinic-chatbot-waqar
 
-# Create a volume for persistent data (WhatsApp auth, database)
-fly volumes create chatbot_data --size 3 --region sin
 ```
 
 ### Step 3: Set Production Secrets
@@ -86,6 +84,13 @@ fly secrets set ADMIN_API_KEY=your-secure-random-key
 
 ```bash
 fly deploy
+```
+
+`fly.toml` in this repository deploys without a required volume.  
+If you want persistent local files (`/app/.data`), copy `fly.example.toml` to `fly.toml` and create a volume first:
+
+```bash
+fly volumes create chatbot_data --size 3 --region <region>
 ```
 
 ### Step 5: Check Status
