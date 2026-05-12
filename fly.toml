@@ -9,10 +9,13 @@ primary_region = 'ams'
   NODE_ENV = 'production'
   PORT = '8080'
   WHATSAPP_ENABLED = 'true'
+  WHATSAPP_AUTH_DIR = '/app/data/baileys-auth'
+  TURSO_DATABASE_URL = 'file:/app/data/local.db'
+  LANCEDB_URI = '/app/data/lancedb'
 
 [[mounts]]
   source = 'chatbot_data'
-  destination = '/app/.data'
+  destination = '/app/data'
 
 [http_service]
   auto_start_machines = true
@@ -25,4 +28,4 @@ primary_region = 'ams'
   cpu_kind = 'shared'
   cpus = 1
   memory = '1gb'
-  memory_mb = 256
+  memory_mb = 512
