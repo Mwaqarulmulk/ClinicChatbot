@@ -240,6 +240,7 @@ export async function handleInboundMessage(
           language,
           businessId: message.businessId,
           customerId: customer.id,
+          customerName: customer.name,
         });
       })
     : await fallbackReply({
@@ -247,6 +248,7 @@ export async function handleInboundMessage(
         language,
         businessId: message.businessId,
         customerId: customer.id,
+        customerName: customer.name,
       });
 
   if (reply.handoff) await markHandoff(conversation.id);
@@ -433,18 +435,38 @@ KEY STYLE RULES:
     ),
   ];
 
+  // Helper: call Groq with automatic retry on 429 rate-limit responses.
+  // Free tier throttles at ~30 rpm; a short back-off recovers cleanly.
+  const callGroq = async (retries = 3) => {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await groq!.chat.completions.create({
+          model: config.GROQ_MODEL,
+          temperature: config.AI_TEMPERATURE,
+          messages: messages as never,
+          tools: toolDefinitions as never,
+          tool_choice: "auto",
+          max_completion_tokens: 800,
+        });
+      } catch (err: unknown) {
+        const status = (err as { status?: number }).status;
+        if (status === 429 && attempt < retries) {
+          const waitMs = 1500 * Math.pow(2, attempt); // 1.5s, 3s, 6s
+          logger.warn({ attempt, waitMs }, "groq rate-limited — retrying");
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error("groq: unreachable after retries");
+  };
+
   // 5 turns: typical flows are get_appointments(1) → reply(2) or
   // get_availability(1) → book(2) → reply(3). 2 was always too tight.
   for (let turn = 0; turn < 5; turn += 1) {
     logger.debug({ turn }, "calling groq");
-    const completion = await groq!.chat.completions.create({
-      model: config.GROQ_MODEL,
-      temperature: config.AI_TEMPERATURE,
-      messages: messages as never,
-      tools: toolDefinitions as never,
-      tool_choice: "auto",
-      max_completion_tokens: 800,
-    });
+    const completion = await callGroq();
     const assistant = completion.choices[0]?.message;
     if (!assistant)
       return {
@@ -498,19 +520,21 @@ async function fallbackReply(input: {
   language: "en" | "ur" | "roman_urdu";
   businessId: string;
   customerId: string;
+  customerName?: string | null;
 }): Promise<ChatReply> {
   const lower = input.text.toLowerCase().trim();
   const isRU = input.language === "roman_urdu";
   const isUR = input.language === "ur";
+  const name = input.customerName;
 
-  // ── 1. Greetings ───────────────────────────────────────────────────────────────────
+  // ── 1. Greetings — use customer's name when known ───────────────────────────────
   if (/^(hi+|hello|hey|salam|assalam|namaste|aoa|aslam\s*u)\b/i.test(lower)) {
     return {
       text: isUR
-        ? "سلام! Demo Clinic کا WhatsApp اسسٹنٹ آپ کی خدمت میں حاضر ہے۔ کیا مدد کر سکتا ہوں؟"
+        ? `سلام${name ? " " + name : ""}! Demo Clinic کا WhatsApp اسسٹنٹ آپ کی خدمت میں حاضر ہے۔ کیا مدد کر سکتا ہوں؟`
         : isRU
-          ? "Salam! Main Demo Clinic ka WhatsApp assistant hoon. Kya madad kar sakta hoon? \ud83d\ude0a"
-          : "Hello! I'm the Demo Clinic assistant. How can I help you today? \ud83d\ude0a",
+          ? `Salam${name ? " " + name : ""}! Main Demo Clinic ka assistant hoon. Kya madad kar sakta hoon? \ud83d\ude0a`
+          : `Hello${name ? " " + name : ""}! I'm the Demo Clinic assistant. How can I help you today? \ud83d\ude0a`,
     };
   }
 
@@ -616,6 +640,28 @@ async function fallbackReply(input: {
       lower,
     );
 
+  // ── 4b. Informational query — search knowledge base BEFORE booking keywords ─────────
+  // "what is the consultation fee?" has "consult" (booking keyword) so must
+  // be caught here first, otherwise it returns the booking prompt.
+  const isInfoQuery =
+    /(how much|what.*fee|fee.*what|price|cost|what.*service|service.*offer|what.*hour|timing|open.*time|close.*time|where.*clinic|clinic.*locat|direct|payment|insur|lab.*test|test.*lab|what.*doctor|doctor.*name|how.*long|wait.*time|how.*book|package|special.*offer)/i.test(
+      lower,
+    ) ||
+    /(kya.*fee|fee.*kya|kitna|rate|charges|kab.*open|timing.*kya|service.*kya|kahan|location|rastha|doctor.*koun|package)/i.test(
+      lower,
+    );
+
+  if (isInfoQuery) {
+    const knowledge = await safeSearchKnowledge(
+      input.businessId,
+      input.text,
+      1,
+    );
+    if (knowledge[0]) {
+      return { text: knowledge[0].content.slice(0, 500) };
+    }
+  }
+
   if (hasBookingKeyword || hasTimeOrDate) {
     return {
       text:
@@ -626,13 +672,22 @@ async function fallbackReply(input: {
     };
   }
 
-  // ── 5. Generic — never return raw knowledge text ───────────────────────────────
+  // ── 5. Generic — try knowledge search one last time, then give helpful default ──────
+  const fallbackKnowledge = await safeSearchKnowledge(
+    input.businessId,
+    input.text,
+    1,
+  );
+  if (fallbackKnowledge[0] && (fallbackKnowledge[0].score ?? 0) > 0.3) {
+    return { text: fallbackKnowledge[0].content.slice(0, 500) };
+  }
+
   return {
     text: isUR
-      ? "Shukriya Demo Clinic se rabta karne ka! Appointment, clinic hours ya kisi aur cheez ke bare mein pooch saktay hain."
+      ? "Shukriya! Appointment book karna, fee puchna ya koi bhi sawaal — main madad kar sakta hoon."
       : isRU
-        ? "Shukriya! Appointment book karna ho ya clinic ki info chahiye, batayein. \ud83d\ude0a"
-        : "Thanks for reaching out to Demo Clinic! I can help with appointments, clinic hours, or any questions. \ud83d\ude0a",
+        ? "Shukriya! Appointment book karna ho, fees jaani ho ya koi sawaal ho — batayein! \ud83d\ude0a"
+        : "Thanks for reaching out to Demo Clinic! \ud83c\udfe5 I can help with appointments, services, fees, or any other questions.",
   };
 }
 
@@ -702,9 +757,21 @@ async function tryDeterministicBooking(input: {
 }
 
 function inferService(text: string): string {
+  if (/dental|teeth|tooth|ortho|brace/i.test(text))
+    return "dental consultation";
+  if (/eye|vision|optic|ophthalm/i.test(text)) return "eye checkup";
+  if (/child|baby|kid|toddler|pediatr/i.test(text))
+    return "pediatric consultation";
+  if (/gynae|gynaecol|obstet|pregnan|period|uterus/i.test(text))
+    return "gynecology consultation";
+  if (/skin|dermat|rash|acne|allerg/i.test(text))
+    return "dermatology consultation";
+  if (/ear|nose|throat|ent|sinus/i.test(text)) return "ENT consultation";
+  if (/lab|test|blood|urine|report/i.test(text)) return "lab test";
+  if (/follow.?up|checkup|check.?up/i.test(text)) return "follow-up";
   if (/consult/i.test(text)) return "consultation";
-  if (/follow/i.test(text)) return "follow-up";
-  return "appointment";
+  // Default to consultation rather than the generic "appointment"
+  return "consultation";
 }
 
 function safeJson(value: string): Record<string, unknown> {
