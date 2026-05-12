@@ -198,8 +198,10 @@ export async function handleInboundMessage(
   // Get knowledge base results
   const knowledge = await safeSearchKnowledge(message.businessId, message.text);
 
-  // Get conversation history for consistent context
-  const history = await recentMessages(conversation.id, 10);
+  // Get conversation history — 20 messages gives the AI enough context for
+  // multi-turn flows (availability check → booking → confirmation)
+  // without pushing the context window too hard.
+  const history = await recentMessages(conversation.id, 20);
 
   // Get customer's appointments for context
   const customerAppointments = await getCustomerAppointments({

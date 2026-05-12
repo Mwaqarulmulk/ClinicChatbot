@@ -6,7 +6,11 @@ import { and, eq, gte, sql } from "drizzle-orm";
 import { config } from "../config";
 import { logger } from "../logger";
 import { handleInboundMessage } from "../ai/orchestrator";
-import { upsertKnowledge } from "../rag/knowledge-base";
+import {
+  deleteKnowledgeByTitle,
+  listKnowledge,
+  upsertKnowledge,
+} from "../rag/knowledge-base";
 import { upcomingAppointments } from "../services/appointments";
 import type { WhatsAppTransport } from "../types";
 import { WindowGuard } from "../utils/window-guard";
@@ -59,69 +63,163 @@ export function createApp(transport: WhatsAppTransport) {
     );
   });
 
-  // ── Chat test console ─────────────────────────────────────────────────────
+  // ── WhatsApp-style chat test UI ─────────────────────────────────────────────────────────────────────────────
   app.get("/chat/test", (c) =>
     c.html(`<!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Chatbot Test Console</title>
-    <style>
-      :root { color-scheme: light dark; font-family: Inter, Segoe UI, Arial, sans-serif; }
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f7f9; color: #14213d; }
-      main { width: min(760px, calc(100vw - 32px)); background: white; border: 1px solid #d8e0e7; border-radius: 8px; padding: 24px; box-shadow: 0 18px 50px rgba(20, 33, 61, .08); }
-      h1 { font-size: 24px; margin: 0 0 16px; }
-      label { display: grid; gap: 6px; font-weight: 650; margin-top: 14px; }
-      input, textarea, button { font: inherit; border-radius: 6px; border: 1px solid #bcc8d4; padding: 11px 12px; }
-      textarea { min-height: 110px; resize: vertical; }
-      button { margin-top: 16px; background: #128c7e; color: white; border-color: #128c7e; cursor: pointer; font-weight: 700; }
-      button:disabled { opacity: .65; cursor: wait; }
-      pre { white-space: pre-wrap; word-break: break-word; background: #101820; color: #e8f3f1; border-radius: 8px; padding: 16px; min-height: 90px; }
-      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-      @media (max-width: 640px) { .row { grid-template-columns: 1fr; } main { padding: 18px; } }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>WhatsApp AI Chatbot Test</h1>
-      <div class="row">
-        <label>Phone<input id="from" value="923001234573" /></label>
-        <label>Name<input id="name" value="Test User" /></label>
-      </div>
-      <label>Message<textarea id="text">What are your business hours?</textarea></label>
-      <button id="send">Send Test Message</button>
-      <h2>Reply</h2>
-      <pre id="output">Ready.</pre>
-    </main>
-    <script>
-      const button = document.getElementById("send");
-      const output = document.getElementById("output");
-      button.addEventListener("click", async () => {
-        button.disabled = true;
-        output.textContent = "Sending...";
-        try {
-          const response = await fetch("/chat/test", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              from: document.getElementById("from").value,
-              name: document.getElementById("name").value,
-              text: document.getElementById("text").value
-            })
-          });
-          const json = await response.json();
-          output.textContent = JSON.stringify(json, null, 2);
-        } catch (error) {
-          output.textContent = String(error);
-        } finally {
-          button.disabled = false;
-        }
-      });
-    </script>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WhatsApp Chatbot Test</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;overflow:hidden}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#111b21;display:flex;flex-direction:column}
+    /* HEADER */
+    .header{background:#202c33;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;border-bottom:1px solid #2d3f4b}
+    .avatar{width:40px;height:40px;border-radius:50%;background:#25d366;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+    .hinfo{flex:1;min-width:0}
+    .hname{font-size:15px;font-weight:600;color:#e9edef}
+    .hstatus{font-size:12px;color:#25d366;display:flex;align-items:center;gap:5px}
+    .hstatus-dot{width:7px;height:7px;border-radius:50%;background:#25d366}
+    .hlinks{display:flex;gap:8px}
+    .hlink{font-size:12px;padding:5px 10px;border-radius:14px;border:1px solid #2d3f4b;color:#8696a0;text-decoration:none;white-space:nowrap}
+    .hlink:hover{border-color:#25d366;color:#25d366}
+    /* SETTINGS BAR */
+    .sbar{background:#1a2530;padding:8px 16px;display:flex;gap:10px;align-items:center;flex-shrink:0;flex-wrap:wrap;border-bottom:1px solid #2d3f4b}
+    .sbar label{font-size:11px;color:#8696a0;white-space:nowrap}
+    .sbar input{background:#2a3942;border:none;border-radius:6px;padding:5px 10px;color:#e9edef;font:inherit;font-size:13px;width:160px;outline:none}
+    .sbtn{font-size:11px;padding:5px 10px;border-radius:12px;border:1px solid #2d3f4b;background:transparent;color:#8696a0;cursor:pointer;white-space:nowrap}
+    .sbtn:hover{border-color:#25d366;color:#25d366}
+    /* CHAT AREA */
+    #chat{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:3px;background:#0b141a}
+    /* WhatsApp wallpaper pattern */
+    #chat{background-color:#0b141a;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Cpath fill='%23182229' fill-opacity='.35' d='M0 0h40v40H0zm40 40h40v40H40z'/%3E%3C/svg%3E")}
+    .day-sep{text-align:center;margin:8px 0}
+    .day-sep span{background:#1f2c34;color:#8696a0;padding:3px 12px;border-radius:6px;font-size:11px}
+    .row{display:flex;margin-bottom:1px}
+    .row.user{justify-content:flex-end}
+    .row.bot{justify-content:flex-start}
+    .bubble{max-width:72%;padding:7px 12px 5px;border-radius:8px;font-size:14px;line-height:1.45;word-break:break-word;position:relative}
+    .bubble.user{background:#005c4b;color:#e9edef;border-radius:8px 0 8px 8px}
+    .bubble.bot{background:#202c33;color:#e9edef;border-radius:0 8px 8px 8px}
+    .bubble.sys{background:rgba(255,255,255,.07);color:#8696a0;font-size:12px;text-align:center;border-radius:8px;max-width:90%;margin:4px auto}
+    .btime{font-size:10px;color:rgba(255,255,255,.45);margin-top:3px;text-align:right}
+    .tick{font-size:10px;margin-left:3px}
+    /* typing */
+    .typing{display:inline-flex;align-items:center;gap:3px;background:#202c33;border-radius:0 8px 8px 8px;padding:10px 14px}
+    .tdot{width:7px;height:7px;border-radius:50%;background:#8696a0;animation:tbounce 1.4s infinite both}
+    .tdot:nth-child(2){animation-delay:.2s}.tdot:nth-child(3){animation-delay:.4s}
+    @keyframes tbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
+    /* HANDOFF BANNER */
+    .handoff-banner{background:rgba(210,153,34,.15);border:1px solid rgba(210,153,34,.35);color:#d29922;border-radius:8px;padding:8px 14px;font-size:12px;text-align:center;margin:4px 0}
+    /* INPUT */
+    .ibar{background:#202c33;padding:8px 12px;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
+    #msg{flex:1;background:#2a3942;border:none;border-radius:20px;padding:9px 16px;color:#e9edef;font:inherit;font-size:14px;resize:none;outline:none;max-height:130px;line-height:1.45}
+    .send-btn{width:46px;height:46px;border-radius:50%;background:#25d366;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;transition:.15s}
+    .send-btn:hover{background:#1aab53}
+    .send-btn:disabled{background:#2a3942;cursor:not-allowed}
+    @media(max-width:500px){.bubble{max-width:88%}.sbar input{width:120px}}
+  </style>
+</head>
+<body>
+<div class="header">
+  <div class="avatar">🏥</div>
+  <div class="hinfo">
+    <div class="hname">Demo Clinic Assistant</div>
+    <div class="hstatus"><span class="hstatus-dot"></span><span id="statusTxt">checking...</span></div>
+  </div>
+  <div class="hlinks">
+    <a class="hlink" href="/">🏠 Home</a>
+    <a class="hlink" href="/admin">⚙️ Admin</a>
+  </div>
+</div>
+<div class="sbar">
+  <label>Phone:</label><input id="fromIn" value="923001234573" />
+  <label>Name:</label><input id="nameIn" value="Test User" />
+  <button class="sbtn" onclick="newUser()">👤 New User</button>
+  <button class="sbtn" onclick="clearChat()">🗑 Clear</button>
+</div>
+<div id="chat">
+  <div class="day-sep"><span>Today</span></div>
+  <div class="row bot"><div class="bubble bot">Welcome! I'm the Demo Clinic assistant.<br>Type a message to start chatting. 😊<div class="btime" id="startTime"></div></div></div>
+</div>
+<div class="ibar">
+  <textarea id="msg" rows="1" placeholder="Type a message..." onkeydown="handleKey(event)" oninput="grow(this)"></textarea>
+  <button class="send-btn" id="sendBtn" onclick="send()" title="Send">➤</button>
+</div>
+<script>
+  var from=document.getElementById('fromIn').value;
+  var name=document.getElementById('nameIn').value;
+  document.getElementById('startTime').textContent=now();
+  // Check WhatsApp status
+  fetch('/health').then(r=>r.json()).then(d=>{
+    document.getElementById('statusTxt').textContent=d.whatsappReady?'online':'AI mode (WhatsApp not connected)';
+  }).catch(()=>{});
+  function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+  function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
+  function grow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,130)+'px';}
+  function handleKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
+  function scrollDown(){var c=document.getElementById('chat');c.scrollTop=c.scrollHeight;}
+  function newUser(){
+    var r=Math.floor(Math.random()*9000+1000);
+    document.getElementById('fromIn').value='923'+r+'00000';
+    document.getElementById('nameIn').value='User '+r;
+    clearChat();
+  }
+  function clearChat(){
+    from=document.getElementById('fromIn').value;
+    name=document.getElementById('nameIn').value;
+    var c=document.getElementById('chat');
+    c.innerHTML='<div class="day-sep"><span>Today</span></div><div class="row bot"><div class="bubble bot">Welcome back! How can I help you? 😊<div class="btime">'+now()+'</div></div></div>';
+  }
+  function addBubble(role,text,extra){
+    var chat=document.getElementById('chat');
+    var row=document.createElement('div');
+    row.className='row '+(role==='user'?'user':'bot');
+    if(role==='sys'){row.className='row bot';row.innerHTML='<div class="bubble sys">'+escHtml(text)+'</div>';}
+    else row.innerHTML='<div class="bubble '+role+'">'+escHtml(text)+(extra||'')+'<div class="btime">'+now()+'</div></div>';
+    chat.appendChild(row);scrollDown();
+  }
+  function showTyping(){
+    var chat=document.getElementById('chat');
+    var row=document.createElement('div');
+    row.className='row bot';row.id='typing-row';
+    row.innerHTML='<div class="typing"><div class="tdot"></div><div class="tdot"></div><div class="tdot"></div></div>';
+    chat.appendChild(row);scrollDown();
+  }
+  function removeTyping(){var t=document.getElementById('typing-row');if(t)t.remove();}
+  async function send(){
+    var text=document.getElementById('msg').value.trim();
+    if(!text)return;
+    from=document.getElementById('fromIn').value||'923001234573';
+    name=document.getElementById('nameIn').value||'User';
+    var btn=document.getElementById('sendBtn');
+    btn.disabled=true;
+    addBubble('user',text,'<span class="tick">✓✓</span>');
+    document.getElementById('msg').value='';
+    document.getElementById('msg').style.height='auto';
+    showTyping();
+    try{
+      var r=await fetch('/chat/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({from,name,text})});
+      var d=await r.json();
+      removeTyping();
+      if(d.text)addBubble('bot',d.text);
+      if(d.handoff){var chat=document.getElementById('chat');var b=document.createElement('div');b.className='handoff-banner';b.textContent='🔁 Transferred to human agent';chat.appendChild(b);scrollDown();}
+      if(d.error)addBubble('sys','Error: '+d.error);
+    }catch(e){
+      removeTyping();
+      addBubble('sys','Network error: '+e.message);
+    }
+    btn.disabled=false;
+    document.getElementById('msg').focus();
+  }
+  document.getElementById('msg').focus();
+</script>
+</body>
 </html>`),
   );
+  // IMPORTANT: keep the POST handler below
 
   app.post("/chat/test", async (c) => {
     const body = testChatSchema.parse(await c.req.json());
@@ -157,7 +255,30 @@ export function createApp(transport: WhatsAppTransport) {
   app.get("/admin/appointments", async (c) => {
     assertAdmin(c.req.header("x-admin-key"));
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
-    const rows = await upcomingAppointments(businessId, 50);
+    // Join with customers so the UI can show name + phone instead of raw IDs
+    const rows = await db
+      .select({
+        id: appointments.id,
+        startsAt: appointments.startsAt,
+        endsAt: appointments.endsAt,
+        service: appointments.service,
+        status: appointments.status,
+        notes: appointments.notes,
+        customerId: appointments.customerId,
+        customerName: customers.name,
+        customerPhone: customers.phone,
+      })
+      .from(appointments)
+      .leftJoin(customers, eq(appointments.customerId, customers.id))
+      .where(
+        and(
+          eq(appointments.businessId, businessId),
+          gte(appointments.startsAt, new Date().toISOString()),
+          eq(appointments.status, "scheduled"),
+        ),
+      )
+      .orderBy(appointments.startsAt)
+      .limit(50);
     return c.json({ appointments: rows });
   });
 
@@ -166,6 +287,50 @@ export function createApp(transport: WhatsAppTransport) {
     const body = sendSchema.parse(await c.req.json());
     await transport.sendText(body.to, body.text);
     return c.json({ ok: true });
+  });
+
+  /** GET /admin/knowledge-list — list all knowledge entries */
+  app.get("/admin/knowledge-list", async (c) => {
+    assertAdmin(c.req.header("x-admin-key"));
+    const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
+    const entries = await listKnowledge(businessId);
+    return c.json({ ok: true, entries });
+  });
+
+  /** DELETE /admin/knowledge — delete all chunks for a title slug */
+  app.delete("/admin/knowledge", async (c) => {
+    assertAdmin(c.req.header("x-admin-key"));
+    const body = deleteKnowledgeSchema.parse(await c.req.json());
+    await deleteKnowledgeByTitle(
+      body.businessId ?? config.DEFAULT_BUSINESS_ID,
+      body.titleSlug,
+    );
+    return c.json({ ok: true });
+  });
+
+  /** POST /admin/broadcast — send a message to all customers */
+  app.post("/admin/broadcast", async (c) => {
+    assertAdmin(c.req.header("x-admin-key"));
+    const body = broadcastSchema.parse(await c.req.json());
+    const businessId = body.businessId ?? config.DEFAULT_BUSINESS_ID;
+    const allCustomers = await db
+      .select({ phone: customers.phone, name: customers.name })
+      .from(customers)
+      .where(eq(customers.businessId, businessId))
+      .limit(500);
+    let sent = 0;
+    let failed = 0;
+    for (const cust of allCustomers) {
+      try {
+        await transport.sendText(cust.phone, body.text);
+        sent++;
+        // Small delay to avoid WhatsApp rate limits
+        await new Promise((r) => setTimeout(r, 300));
+      } catch {
+        failed++;
+      }
+    }
+    return c.json({ ok: true, sent, failed, total: allCustomers.length });
   });
 
   // ── Admin API — new routes ────────────────────────────────────────────────
@@ -230,7 +395,7 @@ export function createApp(transport: WhatsAppTransport) {
     return c.json({
       ok: true,
       period: { todayStart, weekStart, monthStart },
-      messagesReceived: bucket("messages_received"),
+      messagesReceived: bucket("message_received"),
       messageReplied: bucket("message_replied"),
       appointmentBooked: bucket("appointment_booked"),
       handoffCreated: bucket("handoff_created"),
@@ -250,10 +415,11 @@ export function createApp(transport: WhatsAppTransport) {
         name: customers.name,
         language: customers.language,
         createdAt: customers.createdAt,
+        appointmentCount: sql<number>`cast((select count(*) from appointments where appointments.customer_id = ${customers.id}) as integer)`,
       })
       .from(customers)
       .where(eq(customers.businessId, businessId))
-      .orderBy(customers.createdAt)
+      .orderBy(sql`${customers.createdAt} desc`)
       .limit(200);
 
     return c.json({ ok: true, customers: rows });
@@ -272,6 +438,9 @@ export function createApp(transport: WhatsAppTransport) {
     if (body.openHour !== undefined) patch.openHour = body.openHour;
     if (body.closeHour !== undefined) patch.closeHour = body.closeHour;
     if (body.systemPrompt !== undefined) patch.systemPrompt = body.systemPrompt;
+    if (body.timezone !== undefined) patch.timezone = body.timezone;
+    if (body.appointmentDurationMinutes !== undefined)
+      patch.appointmentDurationMinutes = body.appointmentDurationMinutes;
 
     await db.update(businesses).set(patch).where(eq(businesses.id, businessId));
 
@@ -320,11 +489,28 @@ const updateBusinessSchema = z.object({
   openHour: z.coerce.number().int().min(0).max(23).optional(),
   closeHour: z.coerce.number().int().min(1).max(24).optional(),
   systemPrompt: z.string().min(1).optional(),
+  timezone: z.string().optional(),
+  appointmentDurationMinutes: z.coerce
+    .number()
+    .int()
+    .min(5)
+    .max(120)
+    .optional(),
 });
 
 const updateAppointmentSchema = z.object({
   id: z.string().min(1),
   status: z.enum(["scheduled", "cancelled", "completed", "no_show"]),
+});
+
+const deleteKnowledgeSchema = z.object({
+  businessId: z.string().optional(),
+  titleSlug: z.string().min(1),
+});
+
+const broadcastSchema = z.object({
+  businessId: z.string().optional(),
+  text: z.string().min(1).max(1000),
 });
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
@@ -858,33 +1044,56 @@ function adminDashboardHtml(): string {
   <div class="alert alert-blue" style="background:rgba(88,166,255,.1);border-color:rgba(88,166,255,.3);color:var(--blue);font-size:13px;">
     ℹ️ Entries are stored in the <strong>LanceDB</strong> vector store and automatically chunked for semantic search.
   </div>
+  <!-- Knowledge list -->
+  <div style="display:flex;align-items:center;justify-content:space-between;margin:24px 0 14px;">
+    <div class="panel-title" style="margin:0">📚 Existing Knowledge Entries</div>
+    <button class="btn btn-outline" style="font-size:12px;padding:6px 12px" onclick="loadKnowledgeList()">↺ Refresh</button>
+  </div>
+  <div id="knowledgeListContent"><div class="loading-area"><div class="spinner"></div> Loading…</div></div>
 </div>
 
 <!-- MESSAGES TAB -->
 <div class="tab-content" id="tab-messages">
+  <!-- Single message -->
   <div class="panel">
-    <div class="panel-title">📨 Send WhatsApp Message</div>
+    <div class="panel-title">📨 Send Message to Patient</div>
     <div id="sendAlert"></div>
     <form id="sendForm" onsubmit="submitSend(event)">
       <div class="form-group">
         <label class="form-label">Phone Number</label>
-        <input class="form-control" id="sendTo" type="text" placeholder="923001234567 (international format, no +)" required />
-        <div class="form-hint">Include country code without + or spaces. E.g. 923001234567</div>
+        <input class="form-control" id="sendTo" type="text" placeholder="923001234567 (no + or spaces)" required />
+        <div class="form-hint">International format, digits only. E.g. 923001234567</div>
       </div>
       <div class="form-group">
         <label class="form-label">Message</label>
-        <textarea class="form-control" id="sendText" placeholder="Type your message here…" required></textarea>
+        <textarea class="form-control" id="sendText" placeholder="Type your message here…" required style="min-height:90px"></textarea>
       </div>
       <button class="btn btn-green" type="submit" id="sendBtn">📤 Send Message</button>
+    </form>
+  </div>
+  <!-- Broadcast -->
+  <div class="panel">
+    <div class="panel-title">📢 Broadcast to All Patients</div>
+    <div id="broadcastAlert"></div>
+    <div class="alert alert-yellow" style="margin-bottom:16px;font-size:13px;">⚠️ This will send a message to <strong>ALL</strong> registered patients. Use responsibly to avoid WhatsApp blocks.</div>
+    <form id="broadcastForm" onsubmit="submitBroadcast(event)">
+      <div class="form-group">
+        <label class="form-label">Broadcast Message</label>
+        <textarea class="form-control" id="broadcastText" placeholder="Type your broadcast message here…" required style="min-height:90px"></textarea>
+      </div>
+      <button class="btn btn-red" type="submit" id="broadcastBtn">📢 Send to All Patients</button>
     </form>
   </div>
 </div>
 
 <!-- CUSTOMERS TAB -->
 <div class="tab-content" id="tab-customers">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
-    <h2 style="font-size:20px;font-weight:800;">Customers</h2>
-    <button class="btn btn-outline" onclick="loadCustomers()">↺ Refresh</button>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
+    <h2 style="font-size:20px;font-weight:800;">Patients</h2>
+    <div style="display:flex;gap:8px;">
+      <input class="form-control" id="custSearch" placeholder="Search name or phone…" oninput="filterCustomers()" style="width:200px;padding:7px 12px;" />
+      <button class="btn btn-outline" onclick="loadCustomers()">↺ Refresh</button>
+    </div>
   </div>
   <div id="customersContent"><div class="loading-area"><div class="spinner"></div> Loading…</div></div>
 </div>
@@ -897,26 +1106,41 @@ function adminDashboardHtml(): string {
     <form id="settingsForm" onsubmit="submitSettings(event)">
       <div class="form-group">
         <label class="form-label">Business Name</label>
-        <input class="form-control" id="sName" type="text" placeholder="e.g. My Clinic" />
+        <input class="form-control" id="sName" type="text" placeholder="e.g. Demo Clinic" />
       </div>
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">Opening Hour (0–23)</label>
           <input class="form-control" id="sOpenHour" type="number" min="0" max="23" placeholder="9" />
-          <div class="form-hint">24-hour format</div>
+          <div class="form-hint">24-hour format. Default: 9</div>
         </div>
         <div class="form-group">
           <label class="form-label">Closing Hour (1–24)</label>
           <input class="form-control" id="sCloseHour" type="number" min="1" max="24" placeholder="18" />
-          <div class="form-hint">24-hour format</div>
+          <div class="form-hint">24-hour format. Default: 18</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Timezone</label>
+          <input class="form-control" id="sTimezone" type="text" placeholder="Asia/Karachi" />
+          <div class="form-hint">IANA timezone. E.g. Asia/Karachi, UTC, Asia/Dubai</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Appointment Duration (mins)</label>
+          <input class="form-control" id="sAptDuration" type="number" min="5" max="120" placeholder="30" />
+          <div class="form-hint">Slot length in minutes. Default: 30</div>
         </div>
       </div>
       <div class="form-group">
-        <label class="form-label">System Prompt</label>
-        <textarea class="form-control" id="sPrompt" style="min-height:180px;" placeholder="You are a helpful clinic assistant…"></textarea>
-        <div class="form-hint">This defines the AI's personality and instructions.</div>
+        <label class="form-label">System Prompt (AI Personality)</label>
+        <textarea class="form-control" id="sPrompt" style="min-height:200px;" placeholder="You are a helpful clinic assistant…"></textarea>
+        <div class="form-hint">Defines the AI’s persona, tone, and instructions. Changes take effect immediately for new conversations.</div>
       </div>
-      <button class="btn btn-green" type="submit" id="sSubmitBtn">💾 Save Settings</button>
+      <div style="display:flex;gap:12px;align-items:center;">
+        <button class="btn btn-green" type="submit" id="sSubmitBtn">💾 Save Settings</button>
+        <button class="btn btn-outline" type="button" onclick="resetPrompt()">&#8635; Reset to Default</button>
+      </div>
     </form>
   </div>
 </div>
@@ -934,11 +1158,12 @@ function adminDashboardHtml(): string {
       document.getElementById("keyModal").classList.add("hidden");
       updateKeyIndicator();
       loadDashboard();
+      startAutoRefresh();
     }
-    // Handle hash-based navigation from landing page
+    // Handle hash-based navigation from landing page quick actions
     var hash = location.hash.replace("#","");
     if (hash && ["dashboard","appointments","knowledge","messages","customers","settings"].indexOf(hash) !== -1) {
-      switchTab(hash);
+      setTimeout(function() { switchTab(hash); }, 100);
     }
   })();
 
@@ -976,6 +1201,7 @@ function adminDashboardHtml(): string {
           document.getElementById("keyModalError").style.display = "none";
           updateKeyIndicator();
           loadDashboard();
+          startAutoRefresh();
         } else {
           document.getElementById("keyModalError").style.display = "block";
         }
@@ -991,6 +1217,7 @@ function adminDashboardHtml(): string {
   /* ── Tab switching ── */
   var tabLoaders = {
     appointments: loadAppointmentsTab,
+    knowledge: loadKnowledgeList,
     customers: loadCustomers,
     settings: loadSettings,
   };
@@ -1095,29 +1322,61 @@ function adminDashboardHtml(): string {
     var rows = apts.map(function(a) {
       var dt = fmtDate(a.startsAt);
       var statusBadge = '<span class="badge badge-green"><span class="dot"></span>' + escHtml(a.status) + '</span>';
-      var actions = showActions
-        ? '<button class="btn btn-red btn-sm" onclick="cancelApt(\'' + escHtml(a.id) + '\')">✕ Cancel</button>'
+      // Show customer name + phone instead of internal ID
+      var custInfo = (a.customerName || a.customerPhone)
+        ? escHtml(a.customerName || '—') + '<br><span style="font-size:11px;color:var(--muted);font-family:monospace">' + escHtml(a.customerPhone || '') + '</span>'
+        : '<span style="font-family:monospace;font-size:11px;color:var(--muted)">' + escHtml(a.customerId || '—') + '</span>';
+      var sendBtn = showActions
+        ? '<button class="btn btn-outline btn-sm" style="margin-right:6px" onclick="sendToPatient(\'' + escHtml(a.customerPhone || '') + '\')">💬 Message</button>'
         : '';
-      return '<tr><td>' + escHtml(dt) + '</td><td>' + escHtml(a.service || "consultation")
-        + '</td><td style="font-family:monospace;font-size:12px">' + escHtml(a.customerId)
+      var cancelBtn = showActions
+        ? '<button class="btn btn-red btn-sm" onclick="cancelApt(\'' + escHtml(a.id) + '\',\'' + escHtml(a.customerPhone || '') + '\',\'' + escHtml(a.startsAt) + '\')">✕ Cancel</button>'
+        : '';
+      return '<tr><td>' + escHtml(dt) + '</td><td>' + escHtml(a.service || 'consultation')
+        + '</td><td>' + custInfo
         + '</td><td>' + statusBadge + '</td>'
-        + (showActions ? '<td>' + actions + '</td>' : '')
+        + (showActions ? '<td>' + sendBtn + cancelBtn + '</td>' : '')
         + '</tr>';
-    }).join("");
+    }).join('');
     var actionHeader = showActions ? '<th>Actions</th>' : '';
-    return '<table><thead><tr><th>Date / Time</th><th>Service</th><th>Customer ID</th><th>Status</th>'
+    return '<table><thead><tr><th>Date / Time</th><th>Service</th><th>Patient</th><th>Status</th>'
       + actionHeader + '</tr></thead><tbody>' + rows + '</tbody></table>';
   }
 
-  function cancelApt(id) {
-    if (!confirm("Cancel this appointment?")) return;
+  function cancelApt(id, phone, startsAt) {
+    var msg = "Cancel this appointment?";
+    if (phone && startsAt) {
+      var dt = new Date(startsAt).toLocaleString();
+      msg = "Cancel appointment on " + dt + " for " + phone + "?\n\nWould you also like to send a cancellation WhatsApp message to the patient?";
+    }
+    if (!confirm(msg)) return;
     apiPost("/admin/update-appointment", { id: id, status: "cancelled" }).then(function(d) {
-      if (d.ok) loadAppointmentsTab();
-      else alert("Failed: " + (d.error || "unknown error"));
+      if (d.ok) {
+        loadAppointmentsTab();
+        // Offer to notify the patient
+        if (phone && confirm("Appointment cancelled ✓\n\nSend cancellation notification to patient on " + phone + "?")) {
+          var dt = startsAt ? new Date(startsAt).toLocaleString() : "your appointment";
+          apiPost("/admin/send", {
+            to: phone,
+            text: "Dear patient, your appointment on " + dt + " has been cancelled by the clinic. We apologize for any inconvenience. Please contact us to reschedule."
+          }).then(function(r) {
+            if (r.ok) alert("✅ Cancellation notice sent to " + phone);
+          });
+        }
+      } else alert("Failed: " + (d.error || "unknown error"));
     }).catch(function(e) { alert("Error: " + e); });
   }
 
+  function sendToPatient(phone) {
+    if (!phone) return;
+    switchTab('messages');
+    document.getElementById('sendTo').value = phone;
+    document.getElementById('sendText').focus();
+  }
+
   /* ── Knowledge tab ── */
+  var knowledgeListData = [];
+
   function submitKnowledge(e) {
     e.preventDefault();
     var btn = document.getElementById("kSubmitBtn");
@@ -1129,8 +1388,9 @@ function adminDashboardHtml(): string {
     }).then(function(d) {
       btn.disabled = false; btn.textContent = "💾 Save to Knowledge Base";
       if (d.ok) {
-        showAlert("knowledgeAlert", "green", "✅ Saved " + (d.chunks || 1) + " chunk(s) to the knowledge base.");
+        showAlert("knowledgeAlert", "green", "✅ Saved " + (d.chunks || 1) + " chunk(s). Knowledge base updated.");
         document.getElementById("knowledgeForm").reset();
+        loadKnowledgeList();
       } else {
         showAlert("knowledgeAlert", "red", "Error: " + (d.error || JSON.stringify(d)));
       }
@@ -1140,7 +1400,73 @@ function adminDashboardHtml(): string {
     });
   }
 
+  function loadKnowledgeList() {
+    var el = document.getElementById("knowledgeListContent");
+    if (!el) return;
+    el.innerHTML = '<div class="loading-area"><div class="spinner"></div> Loading…</div>';
+    apiGet("/admin/knowledge-list").then(function(d) {
+      var list = d.entries || [];
+      knowledgeListData = list;
+      if (!list.length) {
+        el.innerHTML = '<div class="empty"><div class="empty-icon">📚</div>No knowledge entries yet. Add one above.</div>';
+        return;
+      }
+      var seen = {};
+      var rows = list.filter(function(e) {
+        // Show one row per unique title (might have multiple chunks)
+        var key = e.title;
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+      }).map(function(e) {
+        var slug = e.id.split(':').slice(1, -1).join(':') || e.id;
+        return '<tr>'
+          + '<td style="font-weight:600">' + escHtml(e.title) + '</td>'
+          + '<td style="font-size:12px;color:var(--muted);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(e.content.slice(0,120)) + '…</td>'
+          + '<td><span class="badge badge-blue">' + escHtml(e.source || 'manual') + '</span></td>'
+          + '<td><button class="btn btn-red btn-sm" onclick="deleteKnowledge(\'' + escHtml(slug) + '\',\'' + escHtml(e.title) + '\')">&#128465; Delete</button></td>'
+          + '</tr>';
+      }).join('');
+      el.innerHTML = '<div class="table-wrap"><table>'
+        + '<thead><tr><th>Title</th><th>Preview</th><th>Source</th><th>Actions</th></tr></thead>'
+        + '<tbody>' + rows + '</tbody></table></div>';
+    }).catch(function() {
+      el.innerHTML = '<div class="empty" style="color:var(--red)">Could not load knowledge entries.</div>';
+    });
+  }
+
+  function deleteKnowledge(slug, title) {
+    if (!confirm('Delete all chunks for "' + title + '"? This cannot be undone.')) return;
+    fetch('/admin/knowledge', {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', 'x-admin-key': adminKey },
+      body: JSON.stringify({ titleSlug: slug })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (d.ok) { showAlert('knowledgeAlert', 'green', '✅ Deleted "' + title + '" from knowledge base.'); loadKnowledgeList(); }
+      else showAlert('knowledgeAlert', 'red', 'Error: ' + (d.error || 'unknown'));
+    }).catch(function(e) { showAlert('knowledgeAlert', 'red', 'Network error: ' + e); });
+  }
+
   /* ── Messages tab ── */
+  function submitBroadcast(e) {
+    e.preventDefault();
+    var text = document.getElementById('broadcastText').value.trim();
+    if (!text) return;
+    if (!confirm('Send this message to ALL patients? This cannot be undone.')) return;
+    var btn = document.getElementById('broadcastBtn');
+    btn.disabled = true; btn.textContent = 'Sending…';
+    apiPost('/admin/broadcast', { text: text }).then(function(d) {
+      btn.disabled = false; btn.textContent = '📢 Send to All Patients';
+      if (d.ok) {
+        showAlert('broadcastAlert', 'green', '✅ Sent to ' + d.sent + ' patients. Failed: ' + d.failed + '.');
+        document.getElementById('broadcastText').value = '';
+      } else showAlert('broadcastAlert', 'red', 'Error: ' + (d.error || JSON.stringify(d)));
+    }).catch(function(err) {
+      btn.disabled = false; btn.textContent = '📢 Send to All Patients';
+      showAlert('broadcastAlert', 'red', 'Network error: ' + err);
+    });
+  }
+
   function submitSend(e) {
     e.preventDefault();
     var btn = document.getElementById("sendBtn");
@@ -1163,29 +1489,53 @@ function adminDashboardHtml(): string {
   }
 
   /* ── Customers tab ── */
+  var customersData = [];
+
   function loadCustomers() {
     var el = document.getElementById("customersContent");
     el.innerHTML = '<div class="loading-area"><div class="spinner"></div> Loading…</div>';
     apiGet("/admin/customers").then(function(d) {
-      var list = d.customers || [];
-      if (list.length === 0) {
-        el.innerHTML = '<div class="empty"><div class="empty-icon">👤</div>No customers yet.</div>';
-        return;
-      }
-      var rows = list.map(function(c) {
-        return '<tr>'
-          + '<td style="font-family:monospace;font-size:12px">' + escHtml(c.phone) + '</td>'
-          + '<td>' + escHtml(c.name || "—") + '</td>'
-          + '<td><span class="badge badge-blue">' + escHtml(c.language || "en") + '</span></td>'
-          + '<td style="font-size:12px;color:var(--muted)">' + escHtml(c.createdAt ? new Date(c.createdAt).toLocaleDateString() : "—") + '</td>'
-          + '</tr>';
-      }).join("");
-      el.innerHTML = '<div class="table-wrap"><table>'
-        + '<thead><tr><th>Phone</th><th>Name</th><th>Language</th><th>Joined</th></tr></thead>'
-        + '<tbody>' + rows + '</tbody></table></div>';
+      customersData = d.customers || [];
+      renderCustomerTable(customersData);
     }).catch(function(e) {
-      el.innerHTML = '<div class="empty" style="color:var(--red)">Error: ' + escHtml(String(e)) + '</div>';
+      document.getElementById("customersContent").innerHTML = '<div class="empty" style="color:var(--red)">Error: ' + escHtml(String(e)) + '</div>';
     });
+  }
+
+  function filterCustomers() {
+    var q = (document.getElementById('custSearch').value || '').toLowerCase();
+    var filtered = q
+      ? customersData.filter(function(c) {
+          return (c.name || '').toLowerCase().includes(q) || (c.phone || '').includes(q);
+        })
+      : customersData;
+    renderCustomerTable(filtered);
+  }
+
+  function renderCustomerTable(list) {
+    var el = document.getElementById("customersContent");
+    if (!list.length) {
+      el.innerHTML = '<div class="empty"><div class="empty-icon">👤</div>' + (customersData.length ? 'No patients match your search.' : 'No patients registered yet.') + '</div>';
+      return;
+    }
+    var rows = list.map(function(c) {
+      var apptBadge = c.appointmentCount > 0
+        ? '<span class="badge badge-green">' + c.appointmentCount + ' appts</span>'
+        : '<span class="badge" style="background:rgba(255,255,255,.07);color:var(--muted)">0 appts</span>';
+      var msgBtn = '<button class="btn btn-outline btn-sm" onclick="sendToPatient(\'' + escHtml(c.phone) + '\')">💬 Msg</button>';
+      return '<tr>'
+        + '<td style="font-family:monospace;font-size:13px">' + escHtml(c.phone) + '</td>'
+        + '<td style="font-weight:600">' + escHtml(c.name || '—') + '</td>'
+        + '<td><span class="badge badge-blue">' + escHtml(c.language || 'en') + '</span></td>'
+        + '<td>' + apptBadge + '</td>'
+        + '<td style="font-size:12px;color:var(--muted)">' + escHtml(c.createdAt ? new Date(c.createdAt).toLocaleDateString() : '—') + '</td>'
+        + '<td>' + msgBtn + '</td>'
+        + '</tr>';
+    }).join('');
+    el.innerHTML = '<div style="font-size:12px;color:var(--muted);margin-bottom:10px">' + list.length + ' of ' + customersData.length + ' patients</div>'
+      + '<div class="table-wrap"><table>'
+      + '<thead><tr><th>Phone</th><th>Name</th><th>Language</th><th>Appointments</th><th>Joined</th><th>Actions</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>';
   }
 
   /* ── Settings tab ── */
@@ -1196,9 +1546,11 @@ function adminDashboardHtml(): string {
       document.getElementById("sName").value = b.name || "";
       document.getElementById("sOpenHour").value = b.openHour != null ? b.openHour : "";
       document.getElementById("sCloseHour").value = b.closeHour != null ? b.closeHour : "";
+      document.getElementById("sTimezone").value = b.timezone || "";
+      document.getElementById("sAptDuration").value = b.appointmentDurationMinutes != null ? b.appointmentDurationMinutes : "";
       document.getElementById("sPrompt").value = b.systemPrompt || "";
     }).catch(function() {
-      showAlert("settingsAlert", "yellow", "Could not load current settings — form is empty.");
+      showAlert("settingsAlert", "yellow", "Could not load current settings.");
     });
   }
 
@@ -1210,15 +1562,19 @@ function adminDashboardHtml(): string {
     var name = document.getElementById("sName").value.trim();
     var openH = document.getElementById("sOpenHour").value;
     var closeH = document.getElementById("sCloseHour").value;
+    var tz = document.getElementById("sTimezone").value.trim();
+    var dur = document.getElementById("sAptDuration").value;
     var prompt = document.getElementById("sPrompt").value.trim();
     if (name) payload.name = name;
     if (openH !== "") payload.openHour = parseInt(openH, 10);
     if (closeH !== "") payload.closeHour = parseInt(closeH, 10);
+    if (tz) payload.timezone = tz;
+    if (dur !== "") payload.appointmentDurationMinutes = parseInt(dur, 10);
     if (prompt) payload.systemPrompt = prompt;
     apiPost("/admin/update-business", payload).then(function(d) {
       btn.disabled = false; btn.textContent = "💾 Save Settings";
       if (d.ok) {
-        showAlert("settingsAlert", "green", "✅ Business settings saved successfully.");
+        showAlert("settingsAlert", "green", "✅ Settings saved! New AI persona and hours take effect for all new conversations.");
       } else {
         showAlert("settingsAlert", "red", "Error: " + (d.error || JSON.stringify(d)));
       }
@@ -1226,6 +1582,28 @@ function adminDashboardHtml(): string {
       btn.disabled = false; btn.textContent = "💾 Save Settings";
       showAlert("settingsAlert", "red", "Network error: " + e);
     });
+  }
+
+  function resetPrompt() {
+    if (!confirm('Reset system prompt to default? This will overwrite your current prompt.')) return;
+    document.getElementById('sPrompt').value = 'You are the friendly WhatsApp AI assistant for ' + (document.getElementById('sName').value || 'the clinic') + '. Be warm, natural, and brief — WhatsApp messages should be 2-3 sentences maximum. Reply in the customer\'s language. Match their exact tone and style. NEVER copy knowledge snippet text verbatim. For appointment queries, ALWAYS call get_my_appointments before responding. For new bookings, ask for date and time if missing, then call book_appointment. Never invent availability. For greetings, reply warmly by name — no tool calls needed.';
+    showAlert('settingsAlert', 'yellow', 'Default prompt loaded. Click Save Settings to apply.');
+  }
+
+  /* ── Auto-refresh ── */
+  var refreshTimer = null;
+  var refreshInterval = 30000; // 30 seconds
+
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    refreshTimer = setInterval(function() {
+      if (currentTab === 'dashboard') loadDashboard();
+      else if (currentTab === 'appointments') loadAppointmentsTab();
+    }, refreshInterval);
+  }
+
+  function stopAutoRefresh() {
+    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
   }
 
   /* ── Enter key on key modal ── */

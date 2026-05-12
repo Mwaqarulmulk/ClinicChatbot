@@ -190,3 +190,40 @@ function slug(value: string): string {
     .replace(/(^-|-$)/g, "")
     .slice(0, 80);
 }
+
+/**
+ * List all knowledge entries for a business (for admin display).
+ * Returns entries ordered by title, deduped by id.
+ */
+export async function listKnowledge(
+  businessId: string,
+): Promise<KnowledgeHit[]> {
+  await initKnowledgeBase();
+  const db = await getConnection();
+  const table = await db.openTable(config.RAG_TABLE);
+  const rows = (await table.query().limit(2000).toArray()) as KnowledgeRow[];
+  return rows
+    .filter((row) => row.businessId === businessId)
+    .filter(uniqueById())
+    .map(toKnowledgeHit)
+    .sort((a, b) => a.title.localeCompare(b.title));
+}
+
+/**
+ * Delete all knowledge chunks matching a given id prefix (title slug).
+ * Pass the full id of any chunk to delete all chunks with the same title.
+ */
+export async function deleteKnowledgeByTitle(
+  businessId: string,
+  titleSlug: string,
+): Promise<void> {
+  await initKnowledgeBase();
+  const db = await getConnection();
+  const table = await db.openTable(config.RAG_TABLE);
+  const escapedPrefix = `${businessId}:${titleSlug}`.replace(/'/g, "''");
+  try {
+    await table.delete(`id LIKE '${escapedPrefix}%'`);
+  } catch {
+    // no rows matched — that's fine
+  }
+}
