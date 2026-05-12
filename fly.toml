@@ -1,6 +1,10 @@
-# fly.toml app configuration
+# fly.toml app configuration file generated for clinicchatbot on 2026-05-12T05:24:39Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'clinicchatbot'
-primary_region = 'ams'
+primary_region = 'sin'
 
 [build]
   dockerfile = 'Dockerfile'
@@ -15,14 +19,14 @@ primary_region = 'ams'
   destination = '/app/.data'
 
 [http_service]
-  auto_start_machines = true
-  auto_stop_machines = true
-  force_https = true
   internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
   min_machines_running = 0
 
 [[vm]]
+  memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
-  memory = '1gb'
   memory_mb = 256
