@@ -1,7 +1,7 @@
 import { and, eq, gte, isNull, lte } from "drizzle-orm";
 import { config } from "../config";
 import { db } from "../db/client";
-import { appointments, customers } from "../db/schema";
+import { appointments, businesses, customers } from "../db/schema";
 import { logger } from "../logger";
 import type { WhatsAppTransport } from "../types";
 import { addMinutes, formatLocal } from "../utils/time";
@@ -24,10 +24,16 @@ async function sendDueReminders(transport: WhatsAppTransport) {
   const now = new Date();
   const reminderWindow = addMinutes(now, config.REMINDER_LEAD_MINUTES);
 
+  // Join businesses so we can use the correct per-business timezone
   const rows = await db
-    .select({ appointment: appointments, customer: customers })
+    .select({
+      appointment: appointments,
+      customer: customers,
+      business: businesses,
+    })
     .from(appointments)
     .innerJoin(customers, eq(appointments.customerId, customers.id))
+    .innerJoin(businesses, eq(appointments.businessId, businesses.id))
     .where(
       and(
         eq(appointments.status, "scheduled"),
@@ -39,17 +45,14 @@ async function sendDueReminders(transport: WhatsAppTransport) {
 
   for (const row of rows) {
     const startsAt = new Date(row.appointment.startsAt);
-    const label = formatLocal(startsAt, config.DEFAULT_TIMEZONE);
+    // Use the business's own timezone — NOT config.DEFAULT_TIMEZONE
+    const label = formatLocal(startsAt, row.business.timezone);
     const text =
       row.customer.language === "ur"
         ? `Reminder: aap ki appointment ${label} par hai. Reschedule ke liye reply karein.`
         : `Reminder: your appointment is at ${label}. Reply here if you need to reschedule.`;
 
-    // ── Mark as sent BEFORE sending ───────────────────────────────────────────
-    // This prevents a duplicate-send race condition when multiple instances (e.g.
-    // during a blue-green Fly.io deploy) query the same un-marked rows at the same
-    // time. Marking first means a missed send is preferable to a double send.
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── Mark as sent BEFORE sending to prevent race-condition duplicates ──────
     await db
       .update(appointments)
       .set({

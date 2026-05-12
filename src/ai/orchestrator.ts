@@ -162,6 +162,17 @@ export async function handleInboundMessage(
       role: "assistant",
       content: text,
     });
+    // Track both events — previously these were missing from the keyword-handoff path
+    await trackEvent({
+      businessId: message.businessId,
+      customerId: customer.id,
+      event: "handoff_created",
+    });
+    await trackEvent({
+      businessId: message.businessId,
+      customerId: customer.id,
+      event: "message_replied",
+    });
     return { text, handoff: true };
   }
 
@@ -185,12 +196,20 @@ export async function handleInboundMessage(
       role: "assistant",
       content: deterministicBooking.text,
     });
+    // Track appointment_booked when a booking was made
+    if (deterministicBooking.metadata?.booked) {
+      await trackEvent({
+        businessId: message.businessId,
+        customerId: customer.id,
+        event: "appointment_booked",
+      });
+    }
+    // Always track message_replied (previously the ghost event
+    // "booking_info_requested" was fired but never queried in analytics)
     await trackEvent({
       businessId: message.businessId,
       customerId: customer.id,
-      event: deterministicBooking.metadata?.booked
-        ? "appointment_booked"
-        : "booking_info_requested",
+      event: "message_replied",
     });
     return deterministicBooking;
   }
@@ -222,7 +241,8 @@ export async function handleInboundMessage(
           id: customer.id,
           name: customer.name,
           notes: customer.notes,
-          phone: customer.phone,
+          // phone intentionally omitted: sending phone to a third-party AI API
+          // (Groq) is a privacy violation — the AI never needs to know the number
         },
         language,
         history,
@@ -241,6 +261,7 @@ export async function handleInboundMessage(
           businessId: message.businessId,
           customerId: customer.id,
           customerName: customer.name,
+          timezone: business.timezone,
         });
       })
     : await fallbackReply({
@@ -249,6 +270,7 @@ export async function handleInboundMessage(
         businessId: message.businessId,
         customerId: customer.id,
         customerName: customer.name,
+        timezone: business.timezone,
       });
 
   if (reply.handoff) await markHandoff(conversation.id);
@@ -272,7 +294,7 @@ async function aiReply(input: {
     id: string;
     name?: string | null;
     notes?: string | null;
-    phone: string;
+    // phone removed — never send customer phone numbers to third-party AI APIs
   };
   language: "en" | "ur" | "roman_urdu";
   history: Array<{ role: string; content: string }>;
@@ -292,8 +314,9 @@ async function aiReply(input: {
       "Reply in Roman Urdu / Pakistani English (e.g. 'han sir, apka appointment book ho gaya hai. Jazakallah!'). Match the user's friendly Pakistani tone.";
 
   // Build user context - this is a known customer, provide personalized service
+  // Phone number is intentionally NOT included — never send PII to third-party AI APIs
   const customerNameStr = input.customer.name
-    ? `Customer profile: ${input.customer.name} (Phone: ${input.customer.phone}). Use their name naturally in responses.`
+    ? `Customer profile: ${input.customer.name}. Use their name naturally in responses.`
     : "This is a returning customer. Ask for their name politely if they haven't provided it.";
 
   const preferencesStr = input.customer.notes
@@ -521,7 +544,11 @@ async function fallbackReply(input: {
   businessId: string;
   customerId: string;
   customerName?: string | null;
+  /** Business timezone — used to format appointment times correctly. Falls back to
+   *  config.DEFAULT_TIMEZONE when the caller doesn’t have the business object yet. */
+  timezone?: string;
 }): Promise<ChatReply> {
+  const tz = input.timezone ?? config.DEFAULT_TIMEZONE;
   const lower = input.text.toLowerCase().trim();
   const isRU = input.language === "roman_urdu";
   const isUR = input.language === "ur";
@@ -558,10 +585,7 @@ async function fallbackReply(input: {
         };
       }
       const apt = upcomingApts[0];
-      const label = formatLocal(
-        new Date(apt.startsAt),
-        config.DEFAULT_TIMEZONE,
-      );
+      const label = formatLocal(new Date(apt.startsAt), tz);
       return {
         text:
           isRU || isUR
@@ -610,7 +634,7 @@ async function fallbackReply(input: {
       const list = upcomingApts
         .map(
           (a) =>
-            `\u2022 ${formatLocal(new Date(a.startsAt), config.DEFAULT_TIMEZONE)} \u2014 ${a.service}`,
+            `\u2022 ${formatLocal(new Date(a.startsAt), tz)} \u2014 ${a.service}`,
         )
         .join("\n");
       return {

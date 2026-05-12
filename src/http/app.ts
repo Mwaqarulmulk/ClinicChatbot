@@ -25,7 +25,21 @@ import {
 export function createApp(transport: WhatsAppTransport) {
   const app = new Hono();
   const testChatGuard = new WindowGuard(30, 60_000);
-  app.use("*", cors());
+  // Restrict CORS to known origins — wildcard * allows any site to call admin APIs
+  app.use(
+    "*",
+    cors({
+      origin: (origin) => {
+        if (!origin) return null; // same-origin requests have no Origin header
+        if (origin.includes("clinicchatbot.fly.dev")) return origin;
+        if (origin.includes("localhost") || origin.includes("127.0.0.1"))
+          return origin;
+        return null; // reject unknown origins
+      },
+      allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+      allowHeaders: ["content-type", "x-admin-key"],
+    }),
+  );
 
   app.onError((error, c) => {
     if (error instanceof HTTPException) return error.getResponse();
@@ -987,7 +1001,7 @@ function landingPageHtml(): string {
   </footer>
 
   <script>
-    var adminKey = localStorage.getItem("adminKey");
+    var adminKey = sessionStorage.getItem("adminKey");
 
     // Fetch health
     fetch("/health").then(function(r){ return r.json(); }).then(function(d){
@@ -1019,7 +1033,7 @@ function landingPageHtml(): string {
     });
 
     function loadAppointments() {
-      var key = localStorage.getItem("adminKey");
+      var key = sessionStorage.getItem("adminKey");
       if (!key) {
         document.getElementById("keyPrompt").style.display = "block";
         document.getElementById("aptList").innerHTML = "";
@@ -1055,7 +1069,7 @@ function landingPageHtml(): string {
     function saveKey() {
       var val = document.getElementById("keyInput").value.trim();
       if (!val) return;
-      localStorage.setItem("adminKey", val);
+      sessionStorage.setItem("adminKey", val);
       adminKey = val;
       loadAppointments();
     }
@@ -1784,7 +1798,7 @@ function adminDashboardHtml(): string {
 
 <script>
   /* ── State ── */
-  var adminKey = localStorage.getItem("adminKey") || "";
+  var adminKey = sessionStorage.getItem("adminKey") || "";
   var currentTab = "dashboard";
 
   /* ── Init ── */
@@ -1833,7 +1847,7 @@ function adminDashboardHtml(): string {
         btn.textContent = "Unlock Dashboard";
         if (r.ok) {
           adminKey = val;
-          localStorage.setItem("adminKey", val);
+          sessionStorage.setItem("adminKey", val);
           document.getElementById("keyModal").classList.add("hidden");
           document.getElementById("keyModalError").style.display = "none";
           updateKeyIndicator();

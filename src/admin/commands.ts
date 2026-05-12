@@ -1,9 +1,14 @@
 import { adminPhones, config } from "../config";
 import { upsertKnowledge } from "../rag/knowledge-base";
-import { upcomingAppointments } from "../services/appointments";
+import { getBusiness, upcomingAppointments } from "../services/appointments";
 import { normalizePhone } from "../utils/text";
+import { formatLocal } from "../utils/time";
 
-export async function handleAdminCommand(input: { from: string; text: string; businessId: string }): Promise<string | null> {
+export async function handleAdminCommand(input: {
+  from: string;
+  text: string;
+  businessId: string;
+}): Promise<string | null> {
   const phone = normalizePhone(input.from);
   if (!adminPhones.has(phone)) return null;
   if (!input.text.startsWith("/")) return null;
@@ -16,7 +21,7 @@ export async function handleAdminCommand(input: { from: string; text: string; bu
       "Admin commands:",
       "/appointments - list upcoming appointments",
       "/learn <title> | <content> - add knowledge",
-      "/status - bot status"
+      "/status - bot status",
     ].join("\n");
   }
 
@@ -27,7 +32,14 @@ export async function handleAdminCommand(input: { from: string; text: string; bu
   if (command === "/appointments") {
     const rows = await upcomingAppointments(input.businessId, 10);
     if (!rows.length) return "No upcoming appointments.";
-    return rows.map((row, index) => `${index + 1}. ${row.startsAt} - ${row.service} (${row.status})`).join("\n");
+    // Get business timezone for human-readable formatting
+    const business = await getBusiness(input.businessId);
+    return rows
+      .map(
+        (row, index) =>
+          `${index + 1}. ${formatLocal(new Date(row.startsAt), business.timezone)} — ${row.service} (${row.status})`,
+      )
+      .join("\n");
   }
 
   if (command === "/learn") {
@@ -37,11 +49,10 @@ export async function handleAdminCommand(input: { from: string; text: string; bu
       businessId: input.businessId,
       title,
       content,
-      source: "whatsapp-admin"
+      source: "whatsapp-admin",
     });
     return `Knowledge saved in ${count} chunk(s).`;
   }
 
   return "Unknown admin command. Send /help.";
 }
-

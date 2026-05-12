@@ -1,26 +1,78 @@
+// Only unambiguous Roman Urdu / Pakistani words — removed common English words
+// like "time", "main", "ho", "sir", "ji", "jee" that caused false positives.
 const romanUrduKeywords = new Set([
-  "kya", "kia", "hal", "hai", "mai", "main", "teakh", "theek", "ho", "jazakallah",
-  "han", "haan", "nahi", "nai", "acha", "acha", "shukriya", "bhai", "sir", "jee",
-  "ji", "salam", "assalam", "walaikum", "kal", "aaj", "kab", "kahan", "kaise",
-  "kidhar", "kitne", "kitna", "baje", "bje", "time", "waqt", "kaam", "kam"
+  "kya",
+  "kia",
+  "hai",
+  "hain",
+  "hai",
+  "theek",
+  "jazakallah",
+  "han",
+  "haan",
+  "nahi",
+  "nai",
+  "nahin",
+  "acha",
+  "shukriya",
+  "bhai",
+  "salam",
+  "assalam",
+  "walaikum",
+  "assalamualaikum",
+  "kal",
+  "aaj",
+  "parso",
+  "kab",
+  "kahan",
+  "kaise",
+  "kidhar",
+  "kitne",
+  "kitna",
+  "baje",
+  "bje",
+  "waqt",
+  "kaam",
+  "zaroor",
+  "bilkul",
+  "theek",
+  "thik",
+  "pls",
+  "mujhe",
+  "mera",
+  "meri",
+  "apka",
+  "apki",
+  "aap",
+  "hum",
+  "chahiye",
+  "chahta",
+  "chahti",
+  "karna",
+  "karein",
+  "batao",
+  "please",
+  "zabardast",
+  "inshallah",
+  "mashallah",
 ]);
 
 export function detectLanguage(text: string): "ur" | "en" | "roman_urdu" {
   if (/[\u0600-\u06FF]/.test(text)) return "ur";
-  
-  const words = text.toLowerCase().replace(/[^a-z\s]/g, "").split(/\s+/);
+
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, "")
+    .split(/\s+/);
   let romanUrduMatches = 0;
   for (const word of words) {
-    if (romanUrduKeywords.has(word)) {
-      romanUrduMatches++;
-    }
+    if (romanUrduKeywords.has(word)) romanUrduMatches++;
   }
-  
-  // If we have enough Pakistani English / Roman Urdu keywords, classify as roman_urdu
-  if (romanUrduMatches >= 1 || words.some(w => romanUrduKeywords.has(w))) {
-    return "roman_urdu";
-  }
-  
+
+  // Require at least 2 unambiguous Roman Urdu keywords to avoid misclassifying
+  // common English sentences ("What time does the clinic open?") as Roman Urdu.
+  if (romanUrduMatches >= 2) return "roman_urdu";
+
   return "en";
 }
 
@@ -46,4 +98,3 @@ export function chunkText(text: string, maxChars = 900): string[] {
   if (current) chunks.push(current);
   return chunks;
 }
-

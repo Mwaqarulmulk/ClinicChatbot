@@ -37,6 +37,16 @@ async function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   function shutdown(signal: string) {
     logger.info({ signal }, "shutdown signal received — closing server");
+
+    // Close WhatsApp socket cleanly so the session is preserved
+    if (transport.stop) {
+      void transport
+        .stop()
+        .catch((err: unknown) =>
+          logger.warn({ err }, "whatsapp stop error during shutdown"),
+        );
+    }
+
     server.close(() => {
       logger.info("http server closed — exiting");
       process.exit(0);

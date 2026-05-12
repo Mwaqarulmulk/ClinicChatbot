@@ -29,6 +29,14 @@ jobs:
             exit 1
           fi
 
+      # Install dependencies so tsc can run
+      - name: Install dependencies
+        run: npm ci
+
+      # Catch TypeScript errors before they reach production
+      - name: TypeScript type-check
+        run: npm run typecheck
+
       - name: Set up flyctl
         uses: superfly/flyctl-actions/setup-flyctl@master
 
@@ -36,3 +44,15 @@ jobs:
         run: flyctl deploy --remote-only --wait-timeout 180
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      # Verify the app is actually responding after deployment
+      - name: Post-deploy smoke test
+        run: |
+          echo "Waiting 15s for app to stabilise..."
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://clinicchatbot.fly.dev/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Health check failed — /health returned HTTP $STATUS"
+            exit 1
+          fi
+          echo "✅ Smoke test passed — /health returned 200"

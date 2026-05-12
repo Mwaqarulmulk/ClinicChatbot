@@ -35,9 +35,12 @@ export async function initKnowledgeBase() {
   try {
     await db.openTable(config.RAG_TABLE);
   } catch {
+    // Use the standard ID format (businessId:titleSlug:index) so the admin UI
+    // delete function can find and remove this entry via the LIKE filter.
+    const bootstrapSlug = "getting-started";
     await db.createTable(config.RAG_TABLE, [
       {
-        id: "bootstrap",
+        id: `${config.DEFAULT_BUSINESS_ID}:${bootstrapSlug}:0`,
         businessId: config.DEFAULT_BUSINESS_ID,
         title: "Getting started",
         content:
@@ -184,18 +187,6 @@ function toKnowledgeHit(
       row.score ??
       (typeof row._distance === "number" ? 1 / (1 + row._distance) : undefined),
   };
-}
-
-function keywordScore(query: string, content: string): number {
-  const queryTokens = tokenize(query);
-  if (!queryTokens.length) return 0;
-  const contentTokens = new Set(tokenize(content));
-  return (
-    queryTokens.reduce(
-      (score, token) => score + (contentTokens.has(token) ? 1 : 0),
-      0,
-    ) / queryTokens.length
-  );
 }
 
 function tokenize(value: string): string[] {

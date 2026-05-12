@@ -40,6 +40,22 @@ export class BaileysWhatsApp implements WhatsAppTransport {
     return this.ready;
   }
 
+  /** Gracefully close the socket — called from shutdown handler in index.ts */
+  async stop(): Promise<void> {
+    this.clearReconnectTimer();
+    this.reconnecting = false;
+    if (this.socket) {
+      try {
+        await this.socket.logout();
+      } catch {
+        // logout can fail if already disconnected; that's fine
+      }
+      this.socket = null;
+    }
+    this.ready = false;
+    logger.info("whatsapp socket closed");
+  }
+
   async sendText(to: string, text: string): Promise<void> {
     if (!this.socket) throw new Error("WhatsApp socket not ready");
     await this.socket.sendMessage(
@@ -87,8 +103,23 @@ export class BaileysWhatsApp implements WhatsAppTransport {
         this.socket = null;
         const statusCode = (update.lastDisconnect?.error as Boom | undefined)
           ?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        logger.warn({ statusCode, shouldReconnect }, "whatsapp disconnected");
+        // loggedOut (401) = user de-linked the device — do not reconnect
+        // forbidden (403) = account banned — reconnecting makes a ban permanent
+        // 401 = loggedOut (user de-linked), 403 = forbidden (account banned)
+        // Use literal 403 to avoid the type-cast issue with DisconnectReason enum
+        const permanentFailure =
+          statusCode === DisconnectReason.loggedOut || statusCode === 403;
+        const shouldReconnect = !permanentFailure;
+        logger.warn(
+          { statusCode, shouldReconnect, permanentFailure },
+          "whatsapp disconnected",
+        );
+        if (!shouldReconnect) {
+          logger.error(
+            { statusCode },
+            "permanent whatsapp disconnect — will NOT reconnect",
+          );
+        }
         if (shouldReconnect) {
           // Status 515 = stream conflict — reconnect quickly; otherwise use backoff
           const baseDelay =

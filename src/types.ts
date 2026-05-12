@@ -29,5 +29,6 @@ export type ChatReply = {
 export type WhatsAppTransport = {
   sendText(to: string, text: string): Promise<void>;
   isReady(): boolean;
+  /** Gracefully close the underlying connection. Called during SIGTERM shutdown. */
+  stop?(): Promise<void>;
 };
-
