@@ -19,7 +19,7 @@ import { trackEvent } from "../services/analytics";
 import { logger } from "../logger";
 import type { ChatReply, InboundMessage } from "../types";
 import { detectLanguage, normalizePhone } from "../utils/text";
-import { parseLooseDateTime } from "../utils/time";
+import { formatLocal, parseLooseDateTime } from "../utils/time";
 import { eq } from "drizzle-orm";
 
 type ChatMessage = {
@@ -507,48 +507,104 @@ async function fallbackReply(input: {
   if (/^(hi+|hello|hey|salam|assalam|namaste|aoa|aslam\s*u)\b/i.test(lower)) {
     return {
       text: isUR
-        ? "سلام! آپ کیسہ ہیں؟ Demo Clinic کا WhatsApp اسسٹنٹ کیا مدد کر سکتا ہڼوں؟"
+        ? "سلام! Demo Clinic کا WhatsApp اسسٹنٹ آپ کی خدمت میں حاضر ہے۔ کیا مدد کر سکتا ہوں؟"
         : isRU
-          ? "Salam! Main Demo Clinic ka WhatsApp assistant hoon. Kya madad kar sakta hoon? 😊"
-          : "Hello! I'm the WhatsApp assistant for Demo Clinic. How can I help you today? 😊",
+          ? "Salam! Main Demo Clinic ka WhatsApp assistant hoon. Kya madad kar sakta hoon? \ud83d\ude0a"
+          : "Hello! I'm the Demo Clinic assistant. How can I help you today? \ud83d\ude0a",
     };
   }
 
-  // ── 2. Inquiry about EXISTING appointments ("already booked", "my booking", etc.) ───
-  // IMPORTANT: check this BEFORE isBooking to prevent false booking prompt.
-  const isInquiry =
-    /(tell me|show me|what is my|my booking|booking detail|appointment detail|already book|i have book|i book|maine book|mera appointment|meri appointment|apna appointment|appoint.*status|appoint.*detail|detail.*appoint|check.*appoint|what.*appoint|my appoint|mujhe.*appoint)/i.test(
+  // ── 2. Appointment INQUIRY — make a REAL DB lookup, no placeholders ───────────────
+  // Require at least one appointment/booking keyword alongside the query word
+  // to avoid "tell me about services" hitting this branch.
+  const hasQueryWord =
+    /(tell me|show me|what is my|check|view|see|give me)/i.test(lower);
+  const hasAptWord =
+    /(appoint|booking|schedule|my time|my slot|mera appoint|meri appoint)/i.test(
       lower,
     );
-  if (isInquiry) {
-    return {
-      text:
-        isRU || isUR
-          ? "Aap ke appointments check kar raha hoon. Agar koi appointment hai to abhi bata deta hoon."
-          : "Let me look up your appointments. I’ll share any upcoming bookings right away. If you don’t have one yet, I can help you book! 🗓️",
-    };
+  const alreadyBookedPhrase =
+    /(already book|i have book|i book|maine book|mujhe.*appoint|my appoint|appoint.*detail|booking.*detail)/i.test(
+      lower,
+    );
+
+  if ((hasQueryWord && hasAptWord) || alreadyBookedPhrase) {
+    try {
+      const upcomingApts = await getCustomerAppointments({
+        businessId: input.businessId,
+        customerId: input.customerId,
+      });
+      if (upcomingApts.length === 0) {
+        return {
+          text:
+            isRU || isUR
+              ? "Aap ke abhi koi upcoming appointments nahi hain. Kya main ek book kar doon? \ud83d\uddd3\ufe0f"
+              : "You don't have any upcoming appointments right now. Would you like to book one? \ud83d\uddd3\ufe0f",
+        };
+      }
+      const list = upcomingApts
+        .map(
+          (a) =>
+            `\u2022 ${formatLocal(new Date(a.startsAt), config.DEFAULT_TIMEZONE)} \u2014 ${a.service}`,
+        )
+        .join("\n");
+      return {
+        text:
+          (isRU || isUR
+            ? "Aap ke upcoming appointments:\n"
+            : "Your upcoming appointments:\n") + list,
+      };
+    } catch {
+      return {
+        text:
+          isRU || isUR
+            ? "Appointments check karne mein masla aaya. Dobara try karein."
+            : "Couldn't load appointments right now. Please try again in a moment.",
+      };
+    }
   }
 
-  // ── 3. Cancel / reschedule ────────────────────────────────────────────────────────
+  // ── 3. Cancel / reschedule — show existing appointments first ────────────────────
   if (
     /(cancel|reschedule|change.*appoint|appoint.*cancel|appoint.*change)/i.test(
       lower,
     )
   ) {
-    return {
-      text:
-        isRU || isUR
-          ? "Appointment cancel ya reschedule karne ke liye date aur time batayein."
-          : "To cancel or reschedule, please provide the date and time of your appointment.",
-    };
+    try {
+      const upcomingApts = await getCustomerAppointments({
+        businessId: input.businessId,
+        customerId: input.customerId,
+      });
+      if (upcomingApts.length === 0) {
+        return {
+          text:
+            isRU || isUR
+              ? "Aap ke koi upcoming appointments nahi hain jo cancel ki ja saken."
+              : "You don't have any upcoming appointments to cancel.",
+        };
+      }
+      const apt = upcomingApts[0];
+      const label = formatLocal(
+        new Date(apt.startsAt),
+        config.DEFAULT_TIMEZONE,
+      );
+      return {
+        text:
+          isRU || isUR
+            ? `Aap ki appointment ${label} par hai (${apt.service}). Cancel ya reschedule karna chahte hain?`
+            : `Your appointment is on ${label} for ${apt.service}. Would you like to cancel or reschedule it?`,
+      };
+    } catch {
+      return {
+        text:
+          isRU || isUR
+            ? "Appointment cancel karne ke liye date aur time batayein."
+            : "To cancel, please provide your appointment date and time.",
+      };
+    }
   }
 
   // ── 4. New booking intent OR time-only continuation message ─────────────────────
-  // Catches:
-  //   a) Explicit booking keywords ("book", "consult", "appointment", …)
-  //   b) Continuation time messages after a booking conversation
-  //      ("tomor 2 pm", "10 30 am", "kal 5 bjy") that have no booking keyword
-  //      but are clearly a time/date reply.
   const hasBookingKeyword =
     /(book|visit|meeting|consult|schedule|reserve|waqt|appoint|chahiye|karna|available|slot)/i.test(
       lower,
@@ -564,18 +620,18 @@ async function fallbackReply(input: {
       text:
         isRU || isUR
           ? "Zaroor! Kab ka appointment chahiye? Date aur time batayein, maslan: kal 3 baje."
-          : "Sure! What date and time would you like? For example: tomorrow at 3 PM or Wednesday at 10 AM. 🗓️",
+          : "Sure! What date and time works for you? For example: tomorrow at 3 PM or Friday at 10 AM. \ud83d\uddd3\ufe0f",
       metadata: { bookingIntent: true },
     };
   }
 
-  // ── 5. Generic fallback — NEVER return raw knowledge text ───────────────────────
+  // ── 5. Generic — never return raw knowledge text ───────────────────────────────
   return {
     text: isUR
       ? "Shukriya Demo Clinic se rabta karne ka! Appointment, clinic hours ya kisi aur cheez ke bare mein pooch saktay hain."
       : isRU
-        ? "Shukriya! Appointment book karna ho ya clinic ki info chahiye, batayein. Hum madad karenge! 😊"
-        : "Thanks for reaching out to Demo Clinic! I can help with appointments, clinic hours, or any questions. What do you need? 😊",
+        ? "Shukriya! Appointment book karna ho ya clinic ki info chahiye, batayein. \ud83d\ude0a"
+        : "Thanks for reaching out to Demo Clinic! I can help with appointments, clinic hours, or any questions. \ud83d\ude0a",
   };
 }
 

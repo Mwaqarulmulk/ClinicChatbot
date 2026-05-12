@@ -63,7 +63,7 @@ export function createApp(transport: WhatsAppTransport) {
     );
   });
 
-  // ── WhatsApp-style chat test UI ─────────────────────────────────────────────────────────────────────────────
+  // ── WhatsApp chat test UI ─────────────────────────────────────────────────────────────────────────────
   app.get("/chat/test", (c) =>
     c.html(`<!doctype html>
 <html lang="en">
@@ -113,6 +113,10 @@ export function createApp(transport: WhatsAppTransport) {
     @keyframes tbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
     /* HANDOFF BANNER */
     .handoff-banner{background:rgba(210,153,34,.15);border:1px solid rgba(210,153,34,.35);color:#d29922;border-radius:8px;padding:8px 14px;font-size:12px;text-align:center;margin:4px 0}
+    /* SUGGESTIONS */
+    #suggestions{display:none;flex-wrap:wrap;gap:6px;padding:8px 14px;background:#111b21;border-top:1px solid #2d3f4b;flex-shrink:0}
+    .chip{background:#1f2c34;border:1px solid #2d3f4b;border-radius:16px;padding:5px 12px;font-size:12px;color:#8696a0;cursor:pointer;white-space:nowrap;transition:.15s;font-family:inherit}
+    .chip:hover{border-color:#25d366;color:#25d366}
     /* INPUT */
     .ibar{background:#202c33;padding:8px 12px;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
     #msg{flex:1;background:#2a3942;border:none;border-radius:20px;padding:9px 16px;color:#e9edef;font:inherit;font-size:14px;resize:none;outline:none;max-height:130px;line-height:1.45}
@@ -141,47 +145,142 @@ export function createApp(transport: WhatsAppTransport) {
   <button class="sbtn" onclick="clearChat()">🗑 Clear</button>
 </div>
 <div id="chat">
-  <div class="day-sep"><span>Today</span></div>
-  <div class="row bot"><div class="bubble bot">Welcome! I'm the Demo Clinic assistant.<br>Type a message to start chatting. 😊<div class="btime" id="startTime"></div></div></div>
+  <!-- messages rendered by JS / restored from localStorage -->
 </div>
+<div id="suggestions"><!-- quick-tap chips, shown by JS --></div>
 <div class="ibar">
   <textarea id="msg" rows="1" placeholder="Type a message..." onkeydown="handleKey(event)" oninput="grow(this)"></textarea>
   <button class="send-btn" id="sendBtn" onclick="send()" title="Send">➤</button>
 </div>
 <script>
-  var from=document.getElementById('fromIn').value;
-  var name=document.getElementById('nameIn').value;
-  document.getElementById('startTime').textContent=now();
-  // Check WhatsApp status
-  fetch('/health').then(r=>r.json()).then(d=>{
-    document.getElementById('statusTxt').textContent=d.whatsappReady?'online':'AI mode (WhatsApp not connected)';
-  }).catch(()=>{});
+(function(){
+  /* ── STATE ──────────────────────────────────────────────────────── */
+  var from = document.getElementById('fromIn').value;
+  var name = document.getElementById('nameIn').value;
+  var isSending = false;       // guards against concurrent sends
+  var abortCtrl = null;        // AbortController for current in-flight fetch
+  var STORAGE_KEY = 'chatHistory_v1';
+  var lastSendTime = 0;
+  var MIN_SEND_GAP = 600;      // ms minimum between requests (avoids Groq rate-limit spikes)
+
+  /* ── HELPERS ────────────────────────────────────────────── */
   function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
-  function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
+  function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
   function grow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,130)+'px';}
-  function handleKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
   function scrollDown(){var c=document.getElementById('chat');c.scrollTop=c.scrollHeight;}
-  function newUser(){
-    var r=Math.floor(Math.random()*9000+1000);
-    document.getElementById('fromIn').value='923'+r+'00000';
-    document.getElementById('nameIn').value='User '+r;
-    clearChat();
+  function handleKey(e){
+    if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}
   }
-  function clearChat(){
-    from=document.getElementById('fromIn').value;
-    name=document.getElementById('nameIn').value;
-    var c=document.getElementById('chat');
-    c.innerHTML='<div class="day-sep"><span>Today</span></div><div class="row bot"><div class="bubble bot">Welcome back! How can I help you? 😊<div class="btime">'+now()+'</div></div></div>';
+
+  /* ── HEALTH POLL ─────────────────────────────────────────── */
+  function pollHealth(){
+    fetch('/health').then(function(r){return r.json();}).then(function(d){
+      var el=document.getElementById('statusTxt');
+      var dot=document.querySelector('.hstatus-dot');
+      el.textContent=d.whatsappReady?'online':'AI mode';
+      dot.style.background=d.whatsappReady?'#25d366':'#d29922';
+    }).catch(function(){});
   }
-  function addBubble(role,text,extra){
+  pollHealth();
+  setInterval(pollHealth,30000);
+
+  /* ── SUGGESTIONS ────────────────────────────────────────── */
+  var SUGGESTIONS=[
+    '👋 Hi',
+    '🗓 Book appointment tomorrow 10am',
+    '📝 Tell me my appointments',
+    '💰 What is the consultation fee?',
+    '🧑\u200d⚕️ What services do you offer?',
+    '📍 Where is the clinic?',
+    '⏰ What are the clinic hours?',
+    '❌ Cancel my appointment',
+  ];
+  function showSuggestions(){
+    var el=document.getElementById('suggestions');
+    el.innerHTML=SUGGESTIONS.map(function(s){
+      return '<button class="chip" onclick="useSuggestion(this.textContent)">'+esc(s)+'</button>';
+    }).join('');
+    el.style.display='flex';
+  }
+  function hideSuggestions(){
+    document.getElementById('suggestions').style.display='none';
+  }
+  window.useSuggestion=function(text){
+    document.getElementById('msg').value=text;
+    document.getElementById('msg').focus();
+    hideSuggestions();
+    send();
+  };
+
+  /* ── PERSISTENCE (localStorage) ──────────────────────────── */
+  var msgStore=[];
+  function saveToStorage(){
+    try{localStorage.setItem(STORAGE_KEY+'_'+from,JSON.stringify(msgStore.slice(-80)));}catch(e){}
+  }
+  function loadFromStorage(){
+    try{
+      var saved=localStorage.getItem(STORAGE_KEY+'_'+from);
+      if(saved)msgStore=JSON.parse(saved);
+    }catch(e){msgStore=[];}
+  }
+  function restoreMessages(){
+    loadFromStorage();
+    var chat=document.getElementById('chat');
+    chat.innerHTML='<div class="day-sep"><span>Today</span></div>';
+    if(msgStore.length===0){
+      chat.innerHTML+='<div class="row bot"><div class="bubble bot">Hi! I\u2019m the Demo Clinic assistant. 😊 How can I help you today?<div class="btime">'+now()+'</div></div></div>';
+      showSuggestions();
+    } else {
+      msgStore.forEach(function(m){renderBubble(m.role,m.text,m.extra,m.time,false);});
+      hideSuggestions();
+    }
+    scrollDown();
+  }
+
+  /* ── BUBBLE RENDERING ──────────────────────────────────────── */
+  function renderBubble(role,text,extra,time,save){
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
     row.className='row '+(role==='user'?'user':'bot');
-    if(role==='sys'){row.className='row bot';row.innerHTML='<div class="bubble sys">'+escHtml(text)+'</div>';}
-    else row.innerHTML='<div class="bubble '+role+'">'+escHtml(text)+(extra||'')+'<div class="btime">'+now()+'</div></div>';
-    chat.appendChild(row);scrollDown();
+    if(role==='sys'){
+      row.innerHTML='<div class="bubble sys">'+esc(text)+'</div>';
+    } else if(role==='card'){
+      row.innerHTML=text; // pre-built HTML card
+    } else {
+      row.innerHTML='<div class="bubble '+role+'">'+esc(text)+(extra||'')+'<div class="btime">'+(time||now())+'</div></div>';
+    }
+    chat.appendChild(row);
+    if(save&&role!=='sys'&&role!=='card'){
+      msgStore.push({role:role,text:text,extra:extra||'',time:time||now()});
+      saveToStorage();
+    }
+    scrollDown();
   }
+
+  function addBubble(role,text,extra){
+    renderBubble(role,text,extra,now(),true);
+  }
+
+  /* booking confirmation card */
+  function addBookingCard(text,meta){
+    var chat=document.getElementById('chat');
+    var row=document.createElement('div');
+    row.className='row bot';
+    row.innerHTML='<div class="bubble bot" style="padding:0;overflow:hidden;">'
+      +'<div style="background:rgba(37,211,102,.12);padding:10px 14px;border-bottom:1px solid rgba(37,211,102,.2);font-size:12px;color:#25d366;font-weight:700">✅ Appointment Confirmed</div>'
+      +'<div style="padding:10px 14px;">'+esc(text)+'</div>'
+      +(meta&&meta.appointmentId?'<div style="padding:2px 14px 10px;font-size:10px;color:rgba(255,255,255,.35)">ID: '+esc(meta.appointmentId)+'</div>':'')
+      +'<div class="btime" style="padding:0 14px 8px">'+now()+'</div>'
+      +'</div>';
+    chat.appendChild(row);
+    msgStore.push({role:'bot',text:text,extra:'',time:now()});
+    saveToStorage();
+    scrollDown();
+  }
+
+  /* ── TYPING INDICATOR (idempotent) ───────────────────────────── */
   function showTyping(){
+    if(document.getElementById('typing-row'))return; // idempotent
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
     row.className='row bot';row.id='typing-row';
@@ -189,32 +288,132 @@ export function createApp(transport: WhatsAppTransport) {
     chat.appendChild(row);scrollDown();
   }
   function removeTyping(){var t=document.getElementById('typing-row');if(t)t.remove();}
-  async function send(){
-    var text=document.getElementById('msg').value.trim();
-    if(!text)return;
+
+  /* ── ACTIONS ────────────────────────────────────────────────── */
+  window.newUser=function(){
+    // Cancel any in-flight request first
+    if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
+    isSending=false;
+    removeTyping();
+    document.getElementById('sendBtn').disabled=false;
+    var r=Math.floor(Math.random()*9000+1000);
+    document.getElementById('fromIn').value='923'+r+'00000';
+    document.getElementById('nameIn').value='User'+r;
+    from='923'+r+'00000';
+    name='User'+r;
+    msgStore=[];
+    clearChatUI();
+  };
+
+  window.clearChat=function(){
+    if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
+    isSending=false;
+    removeTyping();
+    document.getElementById('sendBtn').disabled=false;
     from=document.getElementById('fromIn').value||'923001234573';
     name=document.getElementById('nameIn').value||'User';
+    msgStore=[];
+    saveToStorage();
+    clearChatUI();
+  };
+
+  function clearChatUI(){
+    var chat=document.getElementById('chat');
+    chat.innerHTML='<div class="day-sep"><span>Today</span></div>'
+      +'<div class="row bot"><div class="bubble bot">Chat cleared. How can I help you? 😊<div class="btime">'+now()+'</div></div></div>';
+    showSuggestions();
+  }
+
+  /* ── SEND (all race conditions fixed) ───────────────────────── */
+  window.send=async function(){
+    // BUG FIX #1: guard at top — no concurrent sends
+    if(isSending)return;
+    var text=document.getElementById('msg').value.trim();
+    if(!text)return;
+
+    // Rate-limit protection: enforce minimum gap between requests
+    var now_ms=Date.now();
+    var gap=now_ms-lastSendTime;
+    if(gap<MIN_SEND_GAP){
+      await new Promise(function(res){setTimeout(res,MIN_SEND_GAP-gap);});
+    }
+
+    from=document.getElementById('fromIn').value||'923001234573';
+    name=document.getElementById('nameIn').value||'User';
+    isSending=true;
+    lastSendTime=Date.now();
+
     var btn=document.getElementById('sendBtn');
     btn.disabled=true;
+    hideSuggestions();
     addBubble('user',text,'<span class="tick">✓✓</span>');
     document.getElementById('msg').value='';
     document.getElementById('msg').style.height='auto';
     showTyping();
+
+    // BUG FIX #3: AbortController so clearChat() cancels the fetch
+    abortCtrl=new AbortController();
+    var signal=abortCtrl.signal;
+
     try{
-      var r=await fetch('/chat/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({from,name,text})});
-      var d=await r.json();
+      var r=await fetch('/chat/test',{
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({from:from,name:name,text:text}),
+        signal:signal
+      });
+      abortCtrl=null;
       removeTyping();
-      if(d.text)addBubble('bot',d.text);
-      if(d.handoff){var chat=document.getElementById('chat');var b=document.createElement('div');b.className='handoff-banner';b.textContent='🔁 Transferred to human agent';chat.appendChild(b);scrollDown();}
-      if(d.error)addBubble('sys','Error: '+d.error);
+
+      if(r.status===429){
+        addBubble('sys','⚠️ Too many messages. Please wait 5 seconds and try again.');
+        // Re-enable after cooldown
+        setTimeout(function(){isSending=false;btn.disabled=false;document.getElementById('msg').focus();},5000);
+        return;
+      }
+
+      var d=await r.json();
+
+      // Booking confirmation card
+      if(d.metadata&&d.metadata.booked&&d.text){
+        addBookingCard(d.text,d.metadata);
+      } else if(d.text){
+        addBubble('bot',d.text);
+      }
+
+      if(d.handoff){
+        var chat=document.getElementById('chat');
+        var b=document.createElement('div');
+        b.className='handoff-banner';
+        b.textContent='🔁 Transferred to a human agent';
+        chat.appendChild(b);scrollDown();
+      }
+
+      if(d.error&&!d.text)addBubble('sys','Error: '+d.error);
+
     }catch(e){
       removeTyping();
-      addBubble('sys','Network error: '+e.message);
+      if(e.name!=='AbortError'){
+        addBubble('sys','⚠️ Could not reach the server. Please check your connection and retry.');
+      }
     }
+
+    isSending=false;
     btn.disabled=false;
     document.getElementById('msg').focus();
-  }
+  };
+
+  /* ── INIT ───────────────────────────────────────────────────── */
+  restoreMessages();
   document.getElementById('msg').focus();
+
+  // Expose for settings bar events
+  document.getElementById('fromIn').addEventListener('change',function(){
+    from=this.value;
+    restoreMessages();
+  });
+
+})();
 </script>
 </body>
 </html>`),
