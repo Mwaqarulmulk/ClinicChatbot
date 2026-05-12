@@ -680,9 +680,38 @@ async function fallbackReply(input: {
     );
 
   if (isInfoQuery) {
+    // Augment the user's query with canonical English keywords that reliably
+    // match the correct knowledge entry title, regardless of whether the user
+    // asked in English, Roman Urdu, or a mixed phrasing.
+    let searchQuery = input.text;
+    if (
+      /\bhours?\b|\btiming\b|\bopen\b|\bclosed?\b|kab.*khul|kab.*band|waqt|timing.*kya/i.test(
+        lower,
+      )
+    ) {
+      searchQuery = `business hours opening closing time ${input.text}`;
+    } else if (
+      /service|offer|treatment|consult|dental|eye|pediatr|gynae|dermat|ent/i.test(
+        lower,
+      )
+    ) {
+      searchQuery = `services offered ${input.text}`;
+    } else if (/fee|price|cost|charge|rate|kitna|kitne/i.test(lower)) {
+      searchQuery = `consultation fees charges price ${input.text}`;
+    } else if (/doctor|physician|specialist|staff|naam/i.test(lower)) {
+      searchQuery = `doctors at clinic ${input.text}`;
+    } else if (/location|direction|address|where|kahan|rastha/i.test(lower)) {
+      searchQuery = `location directions address clinic ${input.text}`;
+    } else if (/payment|insurance|cash|easy.*paisa|jazzcash/i.test(lower)) {
+      searchQuery = `payment methods insurance ${input.text}`;
+    } else if (/lab|test|blood|report/i.test(lower)) {
+      searchQuery = `lab services tests blood reports ${input.text}`;
+    } else if (/package|checkup|special/i.test(lower)) {
+      searchQuery = `special health packages checkup ${input.text}`;
+    }
     const knowledge = await safeSearchKnowledge(
       input.businessId,
-      input.text,
+      searchQuery,
       1,
     );
     if (knowledge[0]) {
