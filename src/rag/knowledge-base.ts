@@ -130,13 +130,32 @@ export async function searchKnowledge(input: {
     .query()
     .limit(2000)
     .toArray()) as KnowledgeRow[];
-  return fallbackRows
+
+  const ownRows = fallbackRows
     .filter((row) => row.businessId === input.businessId)
-    .filter(uniqueById())
-    .map((row) => ({
-      row,
-      score: keywordScore(input.query, `${row.title} ${row.content}`),
-    }))
+    .filter(uniqueById());
+
+  // ── Title-priority scoring ────────────────────────────────────────────────────────
+  // A query token that exactly matches a word in the TITLE gets a much
+  // higher weight (3×) than a content match. This means "hours" in the
+  // query strongly prefers the "Business Hours" entry over any entry that
+  // merely mentions "hours" somewhere in its body text.
+  const queryTokens = tokenize(input.query);
+  return ownRows
+    .map((row) => {
+      const titleTokens = new Set(tokenize(row.title));
+      const contentTokens = new Set(tokenize(row.content));
+      const titleHits = queryTokens.filter((t) => titleTokens.has(t)).length;
+      const contentHits = queryTokens.filter((t) =>
+        contentTokens.has(t),
+      ).length;
+      // Title matches are weighted 3× more than content matches
+      const score =
+        queryTokens.length > 0
+          ? (titleHits * 3 + contentHits) / (queryTokens.length * 4)
+          : 0;
+      return { row, score };
+    })
     .filter((match) => match.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)

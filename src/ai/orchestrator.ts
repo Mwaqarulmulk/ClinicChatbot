@@ -644,10 +644,14 @@ async function fallbackReply(input: {
   // "what is the consultation fee?" has "consult" (booking keyword) so must
   // be caught here first, otherwise it returns the booking prompt.
   const isInfoQuery =
+    // English informational patterns
     /(how much|what.*fee|fee.*what|price|cost|what.*service|service.*offer|what.*hour|timing|open.*time|close.*time|where.*clinic|clinic.*locat|direct|payment|insur|lab.*test|test.*lab|what.*doctor|doctor.*name|how.*long|wait.*time|how.*book|package|special.*offer)/i.test(
       lower,
     ) ||
-    /(kya.*fee|fee.*kya|kitna|rate|charges|kab.*open|timing.*kya|service.*kya|kahan|location|rastha|doctor.*koun|package)/i.test(
+    // Standalone "hours" or "timing" anywhere in the message
+    /\bhours?\b|\btiming\b|\bschedule\b|\bopen\b|\bclosed?\b/i.test(lower) ||
+    // Roman Urdu informational patterns
+    /(kya.*fee|fee.*kya|kitna|rate|charges|kab.*open|kab.*khulta|kab.*band|timing.*kya|service.*kya|kahan|location|rastha|doctor.*koun|package|hours.*kya|kya.*hours|waqt|dauran)/i.test(
       lower,
     );
 
