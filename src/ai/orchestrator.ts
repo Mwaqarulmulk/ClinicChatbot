@@ -4,7 +4,7 @@ import { businesses } from "../db/schema";
 import { groq } from "./groq";
 import { executeTool, toolDefinitions } from "./tools";
 import { searchKnowledge } from "../rag/knowledge-base";
-import { bookAppointment } from "../services/appointments";
+import { bookAppointment, getCustomerAppointments } from "../services/appointments";
 import { appendMessage, getOrCreateConversation, markHandoff, recentMessages, upsertCustomer } from "../services/customer-store";
 import { trackEvent } from "../services/analytics";
 import type { ChatReply, InboundMessage } from "../types";
@@ -23,21 +23,66 @@ type ChatMessage = {
   }>;
 };
 
+// Intent types for query analysis
+type QueryIntent = {
+  type: "greeting" | "booking" | "availability" | "cancel" | "inquiry" | "complaint" | "general";
+  confidence: number;
+  details?: string;
+};
+
+function analyzeIntent(text: string, language: "en" | "ur" | "roman_urdu"): QueryIntent {
+  const lower = text.toLowerCase();
+  
+  // Greeting patterns
+  if (/^(hi|hello|hey|salam|assalamualikum|namaste|good morning|good afternoon|good evening)/i.test(lower)) {
+    return { type: "greeting", confidence: 0.9 };
+  }
+  
+  // Booking intent
+  if (/book|appointment|visit|meeting|consultation|schedule|reserve|waqt|appoint|chahiye|karna/i.test(lower)) {
+    if (/check|availability|slots|time|kitne|kaun sa/i.test(lower)) {
+      return { type: "availability", confidence: 0.8 };
+    }
+    return { type: "booking", confidence: 0.85 };
+  }
+  
+  // Cancel/Reschedule
+  if (/cancel|reschedule|change|remove|delete/i.test(lower)) {
+    return { type: "cancel", confidence: 0.85 };
+  }
+  
+  // Inquiry about services, prices, hours
+  if (/what|how|tell me|information|info|hours|timing|price|fee|policy|service/i.test(lower)) {
+    return { type: "inquiry", confidence: 0.75 };
+  }
+  
+  // Complaint/frustration
+  if (/bad|worst|terrible|complaint|problem|issue|not happy|disappointed|frustrat/i.test(lower)) {
+    return { type: "complaint", confidence: 0.8 };
+  }
+  
+  return { type: "general", confidence: 0.5 };
+}
+
 export async function handleInboundMessage(message: InboundMessage): Promise<ChatReply> {
   const language = detectLanguage(message.text);
   const phone = normalizePhone(message.from);
+  
+  // Get or create customer with full context
   const customer = await upsertCustomer({
     businessId: message.businessId,
     phone,
     name: message.name,
-    language: language === "roman_urdu" ? "en" : language // keep DB enum happy
+    language: language === "roman_urdu" ? "en" : language
   });
+  
   const conversation = await getOrCreateConversation({
     businessId: message.businessId,
     customerId: customer.id,
     channel: message.channel
   });
 
+  // Store the user message
   await appendMessage({
     conversationId: conversation.id,
     role: "user",
@@ -51,19 +96,24 @@ export async function handleInboundMessage(message: InboundMessage): Promise<Cha
     event: "message_received"
   });
 
+  // Analyze query intent first
+  const intent = analyzeIntent(message.text, language);
+  
+  // Handle handoff requests
   if (shouldHandoff(message.text)) {
     await markHandoff(conversation.id);
-    const text =
-      language === "ur"
-        ? "Theek hai, main aap ko human team se connect kar raha hoon."
-        : "Sure, I am connecting you with a human team member.";
+    const text = language === "ur"
+      ? "Theek hai, main aap ko human team se connect kar raha hoon."
+      : "Sure, I am connecting you with a human team member.";
     await appendMessage({ conversationId: conversation.id, role: "assistant", content: text });
     return { text, handoff: true };
   }
 
+  // Get business info
   const business = await db.query.businesses.findFirst({ where: eq(businesses.id, message.businessId) });
   if (!business) throw new Error(`Business not found: ${message.businessId}`);
 
+  // Handle deterministic booking (fast path)
   const deterministicBooking = await tryDeterministicBooking({
     text: message.text,
     language,
@@ -71,27 +121,53 @@ export async function handleInboundMessage(message: InboundMessage): Promise<Cha
     businessId: message.businessId,
     customerId: customer.id
   });
-  if (deterministicBooking) {
-    // If the tool says "handoff: true", it's yielding back to the main LLM flow
-    // rather than genuinely booking deterministically.
-    if (!deterministicBooking.handoff) {
-      await appendMessage({ conversationId: conversation.id, role: "assistant", content: deterministicBooking.text });
-      await trackEvent({
-        businessId: message.businessId,
-        customerId: customer.id,
-        event: deterministicBooking.metadata?.booked ? "appointment_booked" : "booking_info_requested"
-      });
-      return deterministicBooking;
-    }
+  if (deterministicBooking && !deterministicBooking.handoff) {
+    await appendMessage({ conversationId: conversation.id, role: "assistant", content: deterministicBooking.text });
+    await trackEvent({
+      businessId: message.businessId,
+      customerId: customer.id,
+      event: deterministicBooking.metadata?.booked ? "appointment_booked" : "booking_info_requested"
+    });
+    return deterministicBooking;
   }
 
+  // Get knowledge base results
   const knowledge = await safeSearchKnowledge(message.businessId, message.text);
-  const history = await recentMessages(conversation.id);
+  
+  // Get conversation history for consistent context
+  const history = await recentMessages(conversation.id, 10);
+  
+  // Get customer's appointments for context
+  const customerAppointments = await getCustomerAppointments({
+    businessId: message.businessId,
+    customerId: customer.id
+  });
 
+  // Generate AI reply with full context
+  console.log('[DEBUG] groq exists:', !!groq, '| text:', message.text.substring(0, 20));
+  
   const reply = groq
-    ? await aiReply({ business, customer: { id: customer.id, name: customer.name, notes: customer.notes }, language, history, knowledge }).catch(() =>
-        fallbackReply({ text: message.text, language, businessId: message.businessId, customerId: customer.id })
-      )
+    ? await aiReply({
+      business,
+      customer: { 
+        id: customer.id, 
+        name: customer.name, 
+        notes: customer.notes,
+        phone: customer.phone
+      },
+      language,
+      history,
+      knowledge,
+      intent,
+      customerAppointments: customerAppointments.map(a => ({
+        startsAt: a.startsAt,
+        service: a.service,
+        status: a.status
+      }))
+    }).catch((err) => {
+      console.error('[DEBUG] AI reply error:', err.message);
+      return fallbackReply({ text: message.text, language, businessId: message.businessId, customerId: customer.id });
+    })
     : await fallbackReply({ text: message.text, language, businessId: message.businessId, customerId: customer.id });
 
   if (reply.handoff) await markHandoff(conversation.id);
@@ -99,7 +175,7 @@ export async function handleInboundMessage(message: InboundMessage): Promise<Cha
     conversationId: conversation.id,
     role: "assistant",
     content: reply.text,
-    metadata: reply.metadata
+    metadata: { ...reply.metadata, intent: intent.type }
   });
   await trackEvent({
     businessId: message.businessId,
@@ -111,17 +187,37 @@ export async function handleInboundMessage(message: InboundMessage): Promise<Cha
 
 async function aiReply(input: {
   business: typeof businesses.$inferSelect;
-  customer: { id: string; name?: string | null; notes?: string | null };
+  customer: { id: string; name?: string | null; notes?: string | null; phone: string };
   language: "en" | "ur" | "roman_urdu";
   history: Array<{ role: string; content: string }>;
   knowledge: Array<{ title: string; content: string; source?: string }>;
+  intent: QueryIntent;
+  customerAppointments: Array<{ startsAt: string; service: string; status: string }>;
 }): Promise<ChatReply> {
-  const customerNameStr = input.customer.name ? `The customer's name is ${input.customer.name}. Use it naturally but don't overuse it.` : "You don't know the customer's name yet. If you need it for booking, ask for it politely.";
-  const preferencesStr = input.customer.notes ? `\nCustomer Context/Preferences: ${input.customer.notes}\nUse this context to personalize your responses. If they mention new preferences, use update_customer_preferences to save them.` : "If the user mentions any preferences or important context about themselves, use update_customer_preferences to save them.";
   
   let languageInstruction = "Reply in English.";
   if (input.language === "ur") languageInstruction = "Reply in Urdu script (اردو).";
   if (input.language === "roman_urdu") languageInstruction = "Reply in Roman Urdu / Pakistani English (e.g. 'han sir, apka appointment book ho gaya hai. Jazakallah!'). Match the user's friendly Pakistani tone.";
+
+  // Build user context - this is a known customer, provide personalized service
+  const customerNameStr = input.customer.name 
+    ? `Customer profile: ${input.customer.name} (Phone: ${input.customer.phone}). Use their name naturally in responses.` 
+    : "This is a returning customer. Ask for their name politely if they haven't provided it.";
+    
+  const preferencesStr = input.customer.notes 
+    ? `\nKnown customer preferences: ${input.customer.notes}\nUse this to personalize your responses.` 
+    : "";
+
+  // Include appointment history for context
+  const appointmentContext = input.customerAppointments.length > 0 
+    ? `\nThis customer's appointment history:\n` + input.customerAppointments.map(a => 
+      `- ${a.startsAt}: ${a.service} (${a.status})`
+    ).join("\n")
+    : "\nThis is a new customer with no prior appointments.";
+
+  // Include intent analysis in system prompt
+  const intentStr = `\nCustomer query analysis: ${input.intent.type} (confidence: ${input.intent.confidence}). ` +
+    `Tailor your response based on this intent. For greetings - be warm. For booking - help them book. For availability - show slots. For cancel - help them cancel.`;
 
   const messages: ChatMessage[] = [
     {
@@ -130,14 +226,17 @@ async function aiReply(input: {
         input.business.systemPrompt,
         customerNameStr,
         preferencesStr,
+        appointmentContext,
+        intentStr,
         `Detected customer language/style: ${input.language}. ${languageInstruction}`,
         `Current business date and time is ${new Date().toLocaleString("en-US", { timeZone: input.business.timezone })}.`,
         `Current business hours: ${input.business.openHour}:00-${input.business.closeHour}:00, timezone ${input.business.timezone}.`,
-        "Act completely human. Be warm, empathetic, and conversational. Adapt your personality, politeness, and tone perfectly to how the customer approaches you (e.g. respectful to elders, professional to formal users, friendly to casual users). Do not sound like a robot. Use a friendly tone, occasional emojis, and keep replies short and natural like a real text message.",
-        "When a user says hi, greet them warmly. If you don't know their name, ask how you can help them and politely ask for their name.",
-        "Hidden production method: classify intent silently, retrieve only relevant facts, use tools before making commitments.",
-        "Answer normal FAQ questions directly when business knowledge or business settings contain the answer.",
-        "Only call handoff_to_human for explicit human requests, complaints, unsafe uncertainty, or policy exceptions."
+        "IMPORTANT: You are talking to a returning customer. Reference their history when relevant. Be consistent with previous conversations.",
+        "Act completely human. Be warm, empathetic, and conversational. Adapt your personality, politeness, and tone perfectly to how the customer approaches you. Do not sound like a robot. Use a friendly tone, occasional emojis, and keep replies short and natural like a real text message.",
+        "When a user says hi, greet them warmly by name if known. If you don't know their name, ask how you can help them.",
+        "Use get_my_appointments tool to check the customer's existing appointments. Always provide this information to the customer - never say you don't know if they ask about their appointments.",
+        "Use book_appointment tool to book appointments. Use get_availability to check open slots.",
+        "NEVER call handoff_to_human just because you're unsure - check the tools first. Only escalate to human for explicit requests, serious complaints, or policy violations."
       ].join("\n")
     },
     {
@@ -155,6 +254,7 @@ async function aiReply(input: {
   ];
 
   for (let turn = 0; turn < 2; turn += 1) {
+    console.log('[DEBUG] Calling Groq, turn:', turn);
     const completion = await groq!.chat.completions.create({
       model: config.GROQ_MODEL,
       temperature: config.AI_TEMPERATURE,
@@ -200,7 +300,6 @@ async function fallbackReply(input: { text: string; language: "en" | "ur" | "rom
   
   // Only trigger handoff for explicit cancellation requests, not for checking appointments
   const isCancel = /(cancel|reschedule|change|my appointments|what appointments|mera appointment|meri appointment|check|show)/i.test(lower);
-  // Don't handoff - let the AI handle it via get_my_appointments tool
   if (isCancel) return { text: "Let me check your appointments for you." };
 
   const isBooking = /(book|visit|meeting|consultation|schedule|reserve|waqt|appoint|chahiye|karna)/i.test(lower);
