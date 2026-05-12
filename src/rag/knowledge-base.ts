@@ -202,6 +202,27 @@ function slug(value: string): string {
 }
 
 /**
+ * Find the single best knowledge entry whose title contains the given keyword.
+ * Bypasses vector/ANN search entirely — uses substring title matching which is
+ * 100% reliable for known clinic topics (Hours, Fees, Services, etc.).
+ */
+export async function searchKnowledgeByTitle(
+  businessId: string,
+  titleKeyword: string,
+): Promise<KnowledgeHit | null> {
+  await initKnowledgeBase();
+  const db = await getConnection();
+  const table = await db.openTable(config.RAG_TABLE);
+  const rows = (await table.query().limit(2000).toArray()) as KnowledgeRow[];
+  const lower = titleKeyword.toLowerCase();
+  const match = rows
+    .filter((row) => row.businessId === businessId)
+    .filter(uniqueById())
+    .find((row) => row.title.toLowerCase().includes(lower));
+  return match ? toKnowledgeHit(match) : null;
+}
+
+/**
  * List all knowledge entries for a business (for admin display).
  * Returns entries ordered by title, deduped by id.
  */

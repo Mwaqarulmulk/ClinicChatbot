@@ -3,7 +3,7 @@ import { db } from "../db/client";
 import { businesses } from "../db/schema";
 import { groq } from "./groq";
 import { executeTool, toolDefinitions } from "./tools";
-import { searchKnowledge } from "../rag/knowledge-base";
+import { searchKnowledge, searchKnowledgeByTitle } from "../rag/knowledge-base";
 import {
   bookAppointment,
   getCustomerAppointments,
@@ -680,38 +680,50 @@ async function fallbackReply(input: {
     );
 
   if (isInfoQuery) {
-    // Augment the user's query with canonical English keywords that reliably
-    // match the correct knowledge entry title, regardless of whether the user
-    // asked in English, Roman Urdu, or a mixed phrasing.
-    let searchQuery = input.text;
-    if (
-      /\bhours?\b|\btiming\b|\bopen\b|\bclosed?\b|kab.*khul|kab.*band|waqt|timing.*kya/i.test(
-        lower,
-      )
-    ) {
-      searchQuery = `business hours opening closing time ${input.text}`;
-    } else if (
-      /service|offer|treatment|consult|dental|eye|pediatr|gynae|dermat|ent/i.test(
-        lower,
-      )
-    ) {
-      searchQuery = `services offered ${input.text}`;
-    } else if (/fee|price|cost|charge|rate|kitna|kitne/i.test(lower)) {
-      searchQuery = `consultation fees charges price ${input.text}`;
-    } else if (/doctor|physician|specialist|staff|naam/i.test(lower)) {
-      searchQuery = `doctors at clinic ${input.text}`;
-    } else if (/location|direction|address|where|kahan|rastha/i.test(lower)) {
-      searchQuery = `location directions address clinic ${input.text}`;
-    } else if (/payment|insurance|cash|easy.*paisa|jazzcash/i.test(lower)) {
-      searchQuery = `payment methods insurance ${input.text}`;
-    } else if (/lab|test|blood|report/i.test(lower)) {
-      searchQuery = `lab services tests blood reports ${input.text}`;
-    } else if (/package|checkup|special/i.test(lower)) {
-      searchQuery = `special health packages checkup ${input.text}`;
+    // For known clinic topics, use DIRECT TITLE MATCHING which bypasses the
+    // unreliable local hash-based vector embeddings. This guarantees "what are
+    // your hours?" always returns the 'Business Hours' entry, not a random
+    // entry that happens to contain the word 'hours' in its body text.
+    type TitleMap = [RegExp, string][];
+    const titleMap: TitleMap = [
+      [
+        /\bhours?\b|\btiming\b|\bopen\b|\bclosed?\b|kab.*khul|kab.*band|waqt/i,
+        "Business Hours",
+      ],
+      [
+        /service|offer|treatment|dental|eye|pediatr|gynae|dermat|ent/i,
+        "Services Offered",
+      ],
+      [/fee|price|cost|charge|rate|kitna|kitne/i, "Consultation Fees"],
+      [/doctor|physician|specialist|staff|naam/i, "Doctors at the Clinic"],
+      [
+        /location|direction|address|where|kahan|rastha/i,
+        "Location and Directions",
+      ],
+      [/payment|insurance|cash|easy.*paisa|jazzcash/i, "Payment Methods"],
+      [/lab|test|blood|report/i, "Lab Services"],
+      [/package|checkup|special/i, "Special Health Packages"],
+      [/wait.*time|how.*long|queue/i, "Wait Times"],
+      [/bring|document|card|cnic/i, "What to Bring"],
+      [/pharmacy|medicine|drug/i, "Pharmacy"],
+      [/dental|teeth|tooth/i, "Dental Services"],
+      [/child|baby|kid|pediatr/i, "Pediatric Services"],
+      [/gynae|pregnan|obstet/i, "Gynecology and Obstetrics"],
+      [/skin|dermat|rash/i, "Dermatology"],
+      [/facility|facilities|wifi|parking|access/i, "Clinic Facilities"],
+    ];
+    const matched = titleMap.find(([re]) => re.test(lower));
+    if (matched) {
+      const entry = await searchKnowledgeByTitle(
+        input.businessId,
+        matched[1],
+      ).catch(() => null);
+      if (entry) return { text: entry.content.slice(0, 500) };
     }
+    // Fall back to vector search for unrecognised informational queries
     const knowledge = await safeSearchKnowledge(
       input.businessId,
-      searchQuery,
+      input.text,
       1,
     );
     if (knowledge[0]) {
