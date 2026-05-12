@@ -1,0 +1,28 @@
+# fly.toml app configuration
+app = 'clinicchatbot'
+primary_region = 'ams'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  NODE_ENV = 'production'
+  PORT = '8080'
+  WHATSAPP_ENABLED = 'true'
+
+[[mounts]]
+  source = 'chatbot_data'
+  destination = '/app/.data'
+
+[http_service]
+  auto_start_machines = true
+  auto_stop_machines = true
+  force_https = true
+  internal_port = 8080
+  min_machines_running = 0
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory = '1gb'
+  memory_mb = 256
