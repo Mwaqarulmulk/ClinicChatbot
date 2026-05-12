@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { config } from "../config";
+import { logger } from "../logger";
 import { handleInboundMessage } from "../ai/orchestrator";
 import { upsertKnowledge } from "../rag/knowledge-base";
 import { upcomingAppointments } from "../services/appointments";
@@ -16,8 +17,12 @@ export function createApp(transport: WhatsAppTransport) {
 
   app.onError((error, c) => {
     if (error instanceof HTTPException) return error.getResponse();
-    if (error instanceof z.ZodError) return c.json({ ok: false, error: "validation_error", issues: error.issues }, 400);
-    console.error(error);
+    if (error instanceof z.ZodError)
+      return c.json(
+        { ok: false, error: "validation_error", issues: error.issues },
+        400,
+      );
+    logger.error({ err: error }, "unhandled http error");
     return c.json({ ok: false, error: "internal_error" }, 500);
   });
 
@@ -27,18 +32,21 @@ export function createApp(transport: WhatsAppTransport) {
       service: "whatsapp-ai-chatbot",
       whatsappEnabled: config.WHATSAPP_ENABLED,
       whatsappReady: transport.isReady(),
-      whatsapp: transport.isReady()
-    })
+    }),
   );
 
-  app.get("/ready", (c) =>
-    c.json({
-      ok: transport.isReady(),
-      whatsappEnabled: config.WHATSAPP_ENABLED,
-      whatsappReady: transport.isReady(),
-      whatsapp: transport.isReady()
-    }, transport.isReady() ? 200 : 503)
-  );
+  // Returns 503 until WhatsApp is fully connected — use for readiness probes.
+  app.get("/ready", (c) => {
+    const ready = transport.isReady();
+    return c.json(
+      {
+        ok: ready,
+        whatsappEnabled: config.WHATSAPP_ENABLED,
+        whatsappReady: ready,
+      },
+      ready ? 200 : 503,
+    );
+  });
 
   app.get("/chat/test", (c) =>
     c.html(`<!doctype html>
@@ -100,19 +108,20 @@ export function createApp(transport: WhatsAppTransport) {
       });
     </script>
   </body>
-</html>`)
+</html>`),
   );
 
   app.post("/chat/test", async (c) => {
     const body = testChatSchema.parse(await c.req.json());
-    if (!testChatGuard.allow(body.from)) throw new HTTPException(429, { message: "rate limit exceeded" });
+    if (!testChatGuard.allow(body.from))
+      throw new HTTPException(429, { message: "rate limit exceeded" });
     const reply = await handleInboundMessage({
       businessId: body.businessId ?? config.DEFAULT_BUSINESS_ID,
       channel: "api",
       from: body.from,
       name: body.name,
       text: body.text,
-      timestamp: new Date()
+      timestamp: new Date(),
     });
     return c.json(reply);
   });
@@ -124,7 +133,7 @@ export function createApp(transport: WhatsAppTransport) {
       businessId: body.businessId ?? config.DEFAULT_BUSINESS_ID,
       title: body.title,
       content: body.content,
-      source: body.source ?? "api"
+      source: body.source ?? "api",
     });
     return c.json({ ok: true, chunks });
   });
@@ -147,7 +156,13 @@ export function createApp(transport: WhatsAppTransport) {
 }
 
 function assertAdmin(key: string | undefined) {
-  if (config.ADMIN_API_KEY && key !== config.ADMIN_API_KEY) {
+  // Fail loudly when the secret is not configured — never silently allow open access
+  if (!config.ADMIN_API_KEY) {
+    throw new HTTPException(503, {
+      message: "admin endpoints disabled — set the ADMIN_API_KEY secret",
+    });
+  }
+  if (key !== config.ADMIN_API_KEY) {
     throw new HTTPException(401, { message: "admin key required" });
   }
 }
@@ -156,17 +171,17 @@ const testChatSchema = z.object({
   businessId: z.string().optional(),
   from: z.string().default("test-user"),
   name: z.string().optional(),
-  text: z.string().min(1)
+  text: z.string().min(1),
 });
 
 const knowledgeSchema = z.object({
   businessId: z.string().optional(),
   title: z.string().min(1),
   content: z.string().min(1),
-  source: z.string().optional()
+  source: z.string().optional(),
 });
 
 const sendSchema = z.object({
   to: z.string().min(5),
-  text: z.string().min(1)
+  text: z.string().min(1),
 });

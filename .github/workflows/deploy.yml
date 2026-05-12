@@ -5,15 +5,34 @@ on:
     branches:
       - main
 
+# Prevent concurrent deployments that could corrupt the volume
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    name: Deploy app
+    name: Deploy to Fly.io
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      
-      - run: flyctl deploy --remote-only
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Verify fly.toml is present — it must NOT be in .gitignore
+      - name: Verify fly.toml exists
+        run: |
+          if [ ! -f fly.toml ]; then
+            echo "::error::fly.toml is missing. Make sure it is committed and NOT in .gitignore."
+            exit 1
+          fi
+
+      - name: Set up flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only --wait-timeout 180
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

@@ -1,21 +1,59 @@
-app = "whatsapp-ai-chatbot"
-primary_region = "sin"
+# fly.example.toml — copy this to fly.toml and customise app name / region
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage:
+#   copy fly.example.toml fly.toml          # Windows
+#   cp   fly.example.toml fly.toml          # Linux / macOS
+#
+# Then set required secrets:
+#   fly secrets set GROQ_API_KEY=...
+#   fly secrets set ADMIN_API_KEY=...
+#
+# Optional (for remote Turso database):
+#   fly secrets set TURSO_DATABASE_URL=libsql://your-db.turso.io
+#   fly secrets set TURSO_AUTH_TOKEN=...
+# ─────────────────────────────────────────────────────────────────────────────
+app = "your-app-name"     # change to your Fly app name
+primary_region = "ams"    # nearest region: ams/lhr/sin/iad/ord/…
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
-  NODE_ENV = "production"
-  PORT = "3000"
+  NODE_ENV         = "production"
+  PORT             = "8080"
+  LOG_LEVEL        = "info"
   WHATSAPP_ENABLED = "true"
 
+  # Paths inside the persistent volume (mounted at /app/data below)
+  WHATSAPP_AUTH_DIR  = "/app/data/baileys-auth"
+  TURSO_DATABASE_URL = "file:/app/data/local.db"
+  LANCEDB_URI        = "/app/data/lancedb"
+
+# Persistent volume — create once:
+#   fly volumes create chatbot_data --size 3 --region ams
+[[mounts]]
+  source      = "chatbot_data"
+  destination = "/app/data"
+
+# ── HTTP service ──────────────────────────────────────────────────────────────
+# min_machines_running = 1  →  keep machine alive 24/7 for WhatsApp session
+# auto_stop_machines = false → never hibernate (WhatsApp session dies on sleep)
+# ─────────────────────────────────────────────────────────────────────────────
 [http_service]
-  internal_port = 3000
-  force_https = true
-  auto_stop_machines = false
-  auto_start_machines = true
+  internal_port        = 8080
+  force_https          = true
+  auto_start_machines  = true
+  auto_stop_machines   = false
   min_machines_running = 1
 
-[[mounts]]
-  source = "chatbot_data"
-  destination = "/app/.data"
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval     = "30s"
+    method       = "GET"
+    path         = "/health"
+    timeout      = "10s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus     = 1
+  memory   = "1gb"

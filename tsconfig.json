@@ -2,14 +2,20 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
+    // tsx (TypeScript Execute) handles module resolution at runtime, acting as a
+    // bundler for Node.js. "Bundler" is the correct setting here — it allows the
+    // extensionless imports used throughout the codebase (e.g. "./config" not "./config.js").
     "moduleResolution": "Bundler",
     "strict": true,
     "skipLibCheck": true,
-    "types": ["bun-types"],
+    // Include both Node.js built-in types (process, fs, crypto …) and Bun types
+    // so the language server resolves all runtime globals correctly.
+    // @types/node must be in devDependencies.
+    "types": ["node", "bun-types"],
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "outDir": "dist"
+    "outDir": "dist",
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts", "drizzle.config.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "drizzle.config.ts"],
 }

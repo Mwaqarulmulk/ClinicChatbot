@@ -1,0 +1,35 @@
+# Prevent local node_modules from overwriting the freshly-installed production
+# deps in the Docker image (COPY . . runs after npm ci).
+node_modules/
+
+# Local development data — never bake session credentials or local databases
+# into the image. On Fly.io these live in the persistent /app/data volume.
+.data/
+
+# Build artifacts
+dist/
+
+# Secrets and local config — injected at runtime via fly secrets / env vars
+.env
+.env.*
+*.env
+
+# Lock file for Bun (not used in Docker — we use package-lock.json + npm ci)
+bun.lock
+
+# Logs
+*.log
+npm-debug.log*
+
+# Git internals
+.git/
+.gitignore
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Patch files
+*.patch

@@ -16,14 +16,19 @@ const {
   fetchLatestBaileysVersion,
   isJidBroadcast,
   makeWASocket,
-  useMultiFileAuthState
+  useMultiFileAuthState,
 } = baileys;
+
+// Reconnect backoff: starts at BASE_DELAY_MS, doubles each attempt, caps at MAX_DELAY_MS
+const BASE_RECONNECT_DELAY_MS = 5_000; // 5 seconds
+const MAX_RECONNECT_DELAY_MS = 5 * 60_000; // 5 minutes
 
 export class BaileysWhatsApp implements WhatsAppTransport {
   private socket: ReturnType<typeof makeWASocket> | null = null;
   private ready = false;
   private reconnecting = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
   private processedMessages = new TtlSet(6 * 60 * 60 * 1000);
   private inboundGuard = new WindowGuard(20, 60_000);
 
@@ -37,12 +42,17 @@ export class BaileysWhatsApp implements WhatsAppTransport {
 
   async sendText(to: string, text: string): Promise<void> {
     if (!this.socket) throw new Error("WhatsApp socket not ready");
-    await this.socket.sendMessage(to.includes("@") ? to : `${to}@s.whatsapp.net`, { text } satisfies AnyMessageContent);
+    await this.socket.sendMessage(
+      to.includes("@") ? to : `${to}@s.whatsapp.net`,
+      { text } satisfies AnyMessageContent,
+    );
   }
 
   private async connect() {
     this.clearReconnectTimer();
-    const { state, saveCreds } = await useMultiFileAuthState(config.WHATSAPP_AUTH_DIR);
+    const { state, saveCreds } = await useMultiFileAuthState(
+      config.WHATSAPP_AUTH_DIR,
+    );
     const { version } = await fetchLatestBaileysVersion();
 
     const socket = makeWASocket({
@@ -52,50 +62,80 @@ export class BaileysWhatsApp implements WhatsAppTransport {
       shouldIgnoreJid: (jid) => isJidBroadcast(jid),
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      logger: logger.child({ module: "baileys" }) as never
+      logger: logger.child({ module: "baileys" }) as never,
     });
 
     this.socket = socket;
     socket.ev.on("creds.update", saveCreds);
+
     socket.ev.on("connection.update", async (update) => {
       if (update.qr) {
         qrcode.generate(update.qr, { small: true });
         logger.info("scan the WhatsApp QR code printed in the terminal");
       }
+
       if (update.connection === "open") {
         this.ready = true;
         this.reconnecting = false;
+        this.reconnectAttempt = 0; // reset backoff on successful connect
         this.clearReconnectTimer();
         logger.info("whatsapp connected");
       }
+
       if (update.connection === "close") {
         this.ready = false;
-        const statusCode = (update.lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+        this.socket = null;
+        const statusCode = (update.lastDisconnect?.error as Boom | undefined)
+          ?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         logger.warn({ statusCode, shouldReconnect }, "whatsapp disconnected");
-        this.socket = null;
-        if (shouldReconnect) this.scheduleReconnect(statusCode === 515 ? 1500 : 5000);
+        if (shouldReconnect) {
+          // Status 515 = stream conflict — reconnect quickly; otherwise use backoff
+          const baseDelay =
+            statusCode === 515 ? 1_500 : BASE_RECONNECT_DELAY_MS;
+          this.scheduleReconnect(baseDelay);
+        }
       }
     });
 
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const message of messages) {
-        await this.onMessage(message).catch((error) => logger.error({ err: error }, "message handling failed"));
+        await this.onMessage(message).catch((error) =>
+          logger.error({ err: error }, "message handling failed"),
+        );
       }
     });
   }
 
-  private scheduleReconnect(delayMs: number) {
+  /**
+   * Schedule a reconnect attempt with exponential backoff + ±20 % jitter.
+   * Caps at MAX_RECONNECT_DELAY_MS so it never waits more than 5 minutes.
+   */
+  private scheduleReconnect(baseDelayMs: number) {
     if (this.reconnectTimer) return;
     this.reconnecting = true;
-    logger.info({ delayMs }, "whatsapp reconnect scheduled");
+
+    const exponential = Math.min(
+      baseDelayMs * Math.pow(2, this.reconnectAttempt),
+      MAX_RECONNECT_DELAY_MS,
+    );
+    // Add ±20 % jitter to avoid thundering-herd if multiple bots restart together
+    const jitter = exponential * 0.2 * (Math.random() * 2 - 1);
+    const delay = Math.round(exponential + jitter);
+
+    this.reconnectAttempt += 1;
+    logger.info(
+      { delayMs: delay, attempt: this.reconnectAttempt },
+      "whatsapp reconnect scheduled",
+    );
+
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       void this.connect().catch((error) => {
         logger.error({ err: error }, "whatsapp reconnect failed");
-        this.scheduleReconnect(5000);
+        this.scheduleReconnect(BASE_RECONNECT_DELAY_MS);
       });
-    }, delayMs);
+    }, delay);
   }
 
   private clearReconnectTimer() {
@@ -108,21 +148,27 @@ export class BaileysWhatsApp implements WhatsAppTransport {
     if (!message.message || message.key.fromMe) return;
     const jid = message.key.remoteJid;
     if (!jid || jid.endsWith("@g.us")) return;
-    if (message.key.id && this.processedMessages.hasOrAdd(message.key.id)) return;
+    if (message.key.id && this.processedMessages.hasOrAdd(message.key.id))
+      return;
     if (!this.inboundGuard.allow(jid)) {
-      await this.sendText(jid, "Please slow down a little. I will continue replying in a moment.");
+      await this.sendText(
+        jid,
+        "Please slow down a little. I will continue replying in a moment.",
+      );
       return;
     }
     const media = await maybeAudio(message);
     const caption = extractText(message);
-    const transcription = media ? await transcribeAudio(media.bytes, media.mimeType) : null;
+    const transcription = media
+      ? await transcribeAudio(media.bytes, media.mimeType)
+      : null;
     const text = (caption || transcription || "").trim();
     if (!text && !media) return;
 
     const adminReply = await handleAdminCommand({
       from: jid,
       text,
-      businessId: config.DEFAULT_BUSINESS_ID
+      businessId: config.DEFAULT_BUSINESS_ID,
     });
     if (adminReply) {
       await this.sendText(jid, adminReply);
@@ -134,10 +180,12 @@ export class BaileysWhatsApp implements WhatsAppTransport {
       channel: "whatsapp",
       from: jid,
       name: message.pushName ?? undefined,
-      text: text || "[Voice note received. Please type the request if transcription is unavailable.]",
+      text:
+        text ||
+        "[Voice note received. Please type the request if transcription is unavailable.]",
       messageId: message.key.id ?? undefined,
       timestamp: messageTimestamp(message),
-      media
+      media,
     });
     await this.sendText(jid, reply.text);
   }
@@ -167,6 +215,6 @@ async function maybeAudio(message: WAMessage) {
   return {
     kind: "audio" as const,
     mimeType: message.message.audioMessage.mimetype ?? undefined,
-    bytes: new Uint8Array(bytes)
+    bytes: new Uint8Array(bytes),
   };
 }

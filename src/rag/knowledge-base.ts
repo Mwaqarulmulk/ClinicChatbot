@@ -40,12 +40,13 @@ export async function initKnowledgeBase() {
         id: "bootstrap",
         businessId: config.DEFAULT_BUSINESS_ID,
         title: "Getting started",
-        content: "Add business knowledge with POST /admin/knowledge or bun run seed:knowledge.",
+        content:
+          "Add business knowledge with POST /admin/knowledge or bun run seed:knowledge.",
         source: "system",
         vector: await embedText("getting started business knowledge"),
         createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      }
+        updatedAt: new Date().toISOString(),
+      },
     ]);
   }
   initialized = true;
@@ -63,19 +64,30 @@ export async function upsertKnowledge(input: {
   const table = await db.openTable(config.RAG_TABLE);
   const chunks = chunkText(input.content);
   const now = new Date().toISOString();
-  const rows: KnowledgeRow[] = [];
+  const titleSlug = slug(input.title);
+  const idPrefix = `${input.businessId}:${titleSlug}:`;
 
+  // ── True upsert: delete all existing chunks for this title/business ──────────
+  // Without this, repeated calls silently append duplicates that degrade RAG quality.
+  try {
+    // LanceDB delete accepts a SQL-like WHERE expression
+    await table.delete(`id LIKE '${idPrefix.replace(/'/g, "''")}%'`);
+  } catch {
+    // Expected on first insert — no rows exist yet
+  }
+
+  const rows: KnowledgeRow[] = [];
   for (let index = 0; index < chunks.length; index += 1) {
     const content = chunks[index];
     rows.push({
-      id: `${input.businessId}:${slug(input.title)}:${index}`,
+      id: `${idPrefix}${index}`,
       businessId: input.businessId,
       title: chunks.length > 1 ? `${input.title} (${index + 1})` : input.title,
       content,
       source: input.source,
       vector: await embedText(`${input.title}\n${content}`),
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     });
   }
 
@@ -92,27 +104,42 @@ export async function searchKnowledge(input: {
   const db = await getConnection();
   const table = await db.openTable(config.RAG_TABLE);
   const vector = await embedText(input.query);
+  const limit = input.limit ?? 4;
+
+  // Fetch a generous multiple of the desired limit before filtering by businessId.
+  // In multi-tenant setups, results from other businesses fill the ANN window;
+  // without over-fetch, filtering leaves too few results.
+  const fetchLimit = Math.max(limit * 10, 50);
+
   const rows = (await table
     .search(vector)
-    .limit(Math.max(input.limit ?? 4, 20))
+    .limit(fetchLimit)
     .toArray()) as Array<KnowledgeRow & { _distance?: number; score?: number }>;
 
   const hits = rows
     .filter((row) => row.businessId === input.businessId)
     .filter(uniqueById())
-    .slice(0, input.limit ?? 4)
+    .slice(0, limit)
     .map(toKnowledgeHit);
 
   if (hits.length) return hits;
 
-  const fallbackRows = (await table.query().limit(500).toArray()) as KnowledgeRow[];
+  // Vector search returned nothing relevant — keyword fallback.
+  // Scan up to 2 000 rows so larger knowledge bases still get results.
+  const fallbackRows = (await table
+    .query()
+    .limit(2000)
+    .toArray()) as KnowledgeRow[];
   return fallbackRows
     .filter((row) => row.businessId === input.businessId)
     .filter(uniqueById())
-    .map((row) => ({ row, score: keywordScore(input.query, `${row.title} ${row.content}`) }))
+    .map((row) => ({
+      row,
+      score: keywordScore(input.query, `${row.title} ${row.content}`),
+    }))
     .filter((match) => match.score > 0)
     .sort((a, b) => b.score - a.score)
-    .slice(0, input.limit ?? 4)
+    .slice(0, limit)
     .map((match) => toKnowledgeHit({ ...match.row, score: match.score }));
 }
 
@@ -125,14 +152,18 @@ function uniqueById() {
   };
 }
 
-function toKnowledgeHit(row: KnowledgeRow & { _distance?: number; score?: number }): KnowledgeHit {
+function toKnowledgeHit(
+  row: KnowledgeRow & { _distance?: number; score?: number },
+): KnowledgeHit {
   return {
     id: row.id,
     businessId: row.businessId,
     title: row.title,
     content: row.content,
     source: row.source,
-    score: row.score ?? (typeof row._distance === "number" ? 1 / (1 + row._distance) : undefined)
+    score:
+      row.score ??
+      (typeof row._distance === "number" ? 1 / (1 + row._distance) : undefined),
   };
 }
 
@@ -140,13 +171,16 @@ function keywordScore(query: string, content: string): number {
   const queryTokens = tokenize(query);
   if (!queryTokens.length) return 0;
   const contentTokens = new Set(tokenize(content));
-  return queryTokens.reduce((score, token) => score + (contentTokens.has(token) ? 1 : 0), 0) / queryTokens.length;
+  return (
+    queryTokens.reduce(
+      (score, token) => score + (contentTokens.has(token) ? 1 : 0),
+      0,
+    ) / queryTokens.length
+  );
 }
 
 function tokenize(value: string): string[] {
-  return value
-    .toLowerCase()
-    .match(/[\p{L}\p{N}]{3,}/gu) ?? [];
+  return value.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [];
 }
 
 function slug(value: string): string {
