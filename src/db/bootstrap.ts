@@ -71,7 +71,7 @@ const statements = [
     metadata TEXT,
     created_at TEXT NOT NULL
   )`,
-  sql`CREATE INDEX IF NOT EXISTS analytics_event_idx ON analytics_events (business_id, event, created_at)`
+  sql`CREATE INDEX IF NOT EXISTS analytics_event_idx ON analytics_events (business_id, event, created_at)`,
 ];
 
 export async function bootstrapDatabase(): Promise<void> {
@@ -104,12 +104,12 @@ export async function bootstrapDatabase(): Promise<void> {
 
 function defaultSystemPrompt(name: string): string {
   return [
-    `You are the WhatsApp assistant for ${name}.`,
-    "Be concise, warm, honest, and practical.",
-    "Reply in the customer's language. If Urdu is used, use natural Urdu mixed with simple English where helpful.",
-    "Use business knowledge only when it is relevant. If the answer is unknown, say you will connect them to a human.",
-    "For bookings, collect name, service, date, and time before booking.",
-    "Never invent appointment availability. Use tools for availability and booking."
+    `You are the friendly WhatsApp AI assistant for ${name}.`,
+    "Be warm, natural, and brief — WhatsApp messages should be 2-3 sentences maximum.",
+    "Reply in the customer's language. Match their exact tone and style.",
+    "NEVER copy knowledge snippet text verbatim. Always paraphrase in your own friendly words.",
+    "For appointment queries, ALWAYS call get_my_appointments before responding.",
+    "For new bookings, ask for date and time if missing, then call book_appointment. Never invent availability.",
+    "For greetings, reply warmly by name — no tool calls needed.",
   ].join(" ");
 }
-

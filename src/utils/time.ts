@@ -12,10 +12,13 @@ export function addMinutes(date: Date, minutes: number): Date {
  * Parse a loose natural-language date/time expression into a UTC Date.
  *
  * Supported phrases (case-insensitive):
- *   - "today", "tomorrow"
+ *   - "today", "tomorrow", "tomor", "tmrw", "tmr", "2mrw" (misspellings)
+ *   - Roman Urdu: "kal" (tomorrow), Urdu Unicode: کل
  *   - Day names: "Monday", "next Friday", "this Wednesday"
  *   - ISO date: "2025-06-15"
  *   - Time: "3pm", "10:30am", "14:00"
+ *   - Space-separated: "10 30 am", "10 30 pm"
+ *   - Urdu clock: "5 bjy" / "5 baje" / "3 bje" → PM inference for hours 1–8
  */
 export function parseLooseDateTime(
   text: string,
@@ -23,14 +26,22 @@ export function parseLooseDateTime(
   timeZone?: string,
 ): Date | null {
   const normalized = text.toLowerCase();
-  const timeMatch = normalized.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
   const base = timeZone ? getZonedParts(now, timeZone) : getLocalParts(now);
 
   let year = base.year;
   let month = base.month;
   let day = base.day;
 
-  if (/\btomorrow\b/.test(normalized) || /\u06A9\u0644/.test(text)) {
+  // ── 1. Date resolution ───────────────────────────────────────────────────────────────────────
+  const isTomorrow =
+    // English variants including common misspellings
+    /\b(tomorrow|tomor{1,4}w?|tmr{1,3}w?|2mrw?|nxt\s+day)\b/.test(normalized) ||
+    // Roman Urdu "kal"
+    /\bkal\b/.test(normalized) ||
+    // Urdu Unicode کل
+    /\u06A9\u0644/.test(text);
+
+  if (isTomorrow) {
     const next = addDaysToYmd(year, month, day, 1);
     year = next.year;
     month = next.month;
@@ -38,7 +49,7 @@ export function parseLooseDateTime(
   } else if (/\btoday\b/.test(normalized)) {
     // Keep the base date
   } else {
-    // ── Day-of-week parsing: "Monday", "next Friday", "this Wednesday" ─────────
+    // Day-of-week parsing: "Monday", "next Friday", "this Wednesday"
     const dayNames = [
       "sunday",
       "monday",
@@ -57,7 +68,6 @@ export function parseLooseDateTime(
       const currentDay = baseDate.getDay();
       const forceNext = dayMatch[1]?.trim() === "next";
       let daysAhead = targetDay - currentDay;
-      // "this Friday" when today is Friday → same day; "next Friday" → +7 days
       if (daysAhead < 0 || (daysAhead === 0 && forceNext)) daysAhead += 7;
       const next = addDaysToYmd(year, month, day, daysAhead);
       year = next.year;
@@ -74,15 +84,68 @@ export function parseLooseDateTime(
     }
   }
 
-  if (!timeMatch) return null;
-  let hour = Number(timeMatch[1]);
-  const minute = Number(timeMatch[2] ?? "0");
-  const meridiem = timeMatch[3];
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
-  if (timeZone)
-    return zonedTimeToUtc({ year, month, day, hour, minute }, timeZone);
-  return new Date(year, month - 1, day, hour, minute, 0, 0);
+  // ── 2. Time resolution (ordered by confidence) ────────────────────────────────────────
+
+  // A. Urdu clock marker: "5 bjy", "5 baje", "3 bje", "5 بجے"
+  //    In Pakistani business context, 1–8 o’clock = PM; 9–12 = AM/noon.
+  const urduClockMatch = normalized.match(
+    /\b(\d{1,2})\s*(?:baj[ey]?|bjy|bje|\u0628\u062c\u06d2|\u0628\u062c\u06d2)\b/,
+  );
+  if (urduClockMatch) {
+    let h = Number(urduClockMatch[1]);
+    if (h >= 1 && h <= 8) h += 12; // PM inference
+    if (timeZone)
+      return zonedTimeToUtc({ year, month, day, hour: h, minute: 0 }, timeZone);
+    return new Date(year, month - 1, day, h, 0, 0, 0);
+  }
+
+  // B. "HH:MM am/pm" or "HH.MM am/pm"
+  const colonMeridiem = normalized.match(/\b(\d{1,2})[:.](\d{2})\s*(am|pm)\b/);
+  if (colonMeridiem) {
+    let h = Number(colonMeridiem[1]);
+    const m = Number(colonMeridiem[2]);
+    if (colonMeridiem[3] === "pm" && h < 12) h += 12;
+    if (colonMeridiem[3] === "am" && h === 12) h = 0;
+    if (timeZone)
+      return zonedTimeToUtc({ year, month, day, hour: h, minute: m }, timeZone);
+    return new Date(year, month - 1, day, h, m, 0, 0);
+  }
+
+  // C. Space-separated "HH MM am/pm" (e.g. "10 30 am", "10 30 pm")
+  const spaceMeridiem = normalized.match(/\b(\d{1,2})\s+(\d{2})\s+(am|pm)\b/);
+  if (spaceMeridiem) {
+    let h = Number(spaceMeridiem[1]);
+    const m = Number(spaceMeridiem[2]);
+    if (spaceMeridiem[3] === "pm" && h < 12) h += 12;
+    if (spaceMeridiem[3] === "am" && h === 12) h = 0;
+    if (timeZone)
+      return zonedTimeToUtc({ year, month, day, hour: h, minute: m }, timeZone);
+    return new Date(year, month - 1, day, h, m, 0, 0);
+  }
+
+  // D. "HH am/pm" — hour only with explicit meridiem
+  const hourMeridiem = normalized.match(/\b(\d{1,2})\s*(am|pm)\b/);
+  if (hourMeridiem) {
+    let h = Number(hourMeridiem[1]);
+    if (hourMeridiem[2] === "pm" && h < 12) h += 12;
+    if (hourMeridiem[2] === "am" && h === 12) h = 0;
+    if (timeZone)
+      return zonedTimeToUtc({ year, month, day, hour: h, minute: 0 }, timeZone);
+    return new Date(year, month - 1, day, h, 0, 0, 0);
+  }
+
+  // E. "HH:MM" or "HH.MM" — no meridiem, treat as-is (24-hour)
+  const colonOnly = normalized.match(/\b(\d{1,2})[:.](\d{2})\b/);
+  if (colonOnly) {
+    const h = Number(colonOnly[1]);
+    const m = Number(colonOnly[2]);
+    if (timeZone)
+      return zonedTimeToUtc({ year, month, day, hour: h, minute: m }, timeZone);
+    return new Date(year, month - 1, day, h, m, 0, 0);
+  }
+
+  // No time component found
+  return null;
 }
 
 /**

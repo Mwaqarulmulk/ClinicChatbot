@@ -55,16 +55,29 @@ function analyzeIntent(
 
   // Greeting patterns
   if (
-    /^(hi|hello|hey|salam|assalamualikum|namaste|good morning|good afternoon|good evening)/i.test(
-      lower,
+    /^(hi+|hello|hey|salam|assalamualikum|namaste|aoa|good morning|good afternoon|good evening)/i.test(
+      lower.trim(),
     )
   ) {
     return { type: "greeting", confidence: 0.9 };
   }
 
-  // Booking intent
+  // ── Inquiry about EXISTING appointments (check BEFORE booking) ────────────
+  // Prevents "tell me my booking" from being misclassified as a new booking request.
   if (
-    /book|appointment|visit|meeting|consultation|schedule|reserve|waqt|appoint|chahiye|karna/i.test(
+    /\b(tell me|show me|what is my|my booking|booking detail|appointment detail|already book|i have book|i book|maine book|mera appointment|meri appointment|appoint.*status|check.*appoint|what.*appoint|my appoint|detail.*appoint|mujhe.*appoint|appoint.*deta|apna appointment|cancel|reschedule)/i.test(
+      lower,
+    )
+  ) {
+    if (/cancel|reschedule/i.test(lower)) {
+      return { type: "cancel", confidence: 0.9 };
+    }
+    return { type: "inquiry", confidence: 0.9 };
+  }
+
+  // Booking intent (only after inquiry check)
+  if (
+    /book|appointment|visit|meeting|consult|schedule|reserve|waqt|appoint|chahiye|karna/i.test(
       lower,
     )
   ) {
@@ -301,33 +314,46 @@ async function aiReply(input: {
     {
       role: "system",
       content: [
+        // ── ROLE & PERSONA ────────────────────────────────────────────────────────────────────────
         input.business.systemPrompt,
+        "",
+        // ── CUSTOMER CONTEXT ──────────────────────────────────────────────────────────
         customerNameStr,
         preferencesStr,
         appointmentContext,
+        "",
+        // ── STRICT RULES (follow every single one) ──────────────────────────────────
+        "STRICT RULES:",
+        "1. NEVER copy or repeat any knowledge snippet text verbatim. Use snippets as background only; always write your reply in your own words.",
+        "2. Keep replies SHORT — 2–3 sentences max. This is WhatsApp, not email.",
+        "3. Greetings (hi / hello / salam / aoa): reply warmly using the customer's name. Do NOT call any tools.",
+        "4. 'What is my name' / 'tell me about me' / 'who am I': answer directly from the Customer Context above. Do NOT call any tools.",
+        "5. 'My appointments' / 'my booking' / 'booking detail' / 'already booked': call get_my_appointments FIRST, then reply with the result. Do NOT ask for a date/time.",
+        "6. Booking a new appointment: ask for date+time if not provided, then call book_appointment.",
+        "7. Cancellation: call get_my_appointments first to see what exists, then call cancel_appointment.",
+        "8. NEVER call handoff_to_human for ordinary questions. Only escalate when the customer explicitly demands a human, or for a serious unresolvable complaint.",
+        "",
+        // ── CURRENT CONTEXT ─────────────────────────────────────────────────────────────────────
+        `Language: ${input.language}. ${languageInstruction}`,
+        `Business hours: ${input.business.openHour}:00–${input.business.closeHour}:00 (${input.business.timezone})`,
+        `Current time: ${new Date().toLocaleString("en-US", { timeZone: input.business.timezone })}`,
         intentStr,
-        `Detected customer language/style: ${input.language}. ${languageInstruction}`,
-        `Current business date and time is ${new Date().toLocaleString("en-US", { timeZone: input.business.timezone })}.`,
-        `Current business hours: ${input.business.openHour}:00-${input.business.closeHour}:00, timezone ${input.business.timezone}.`,
-        "IMPORTANT: You are talking to a returning customer. Reference their history when relevant. Be consistent with previous conversations.",
-        "Act completely human. Be warm, empathetic, and conversational. Adapt your personality, politeness, and tone perfectly to how the customer approaches you. Do not sound like a robot. Use a friendly tone, occasional emojis, and keep replies short and natural like a real text message.",
-        "When a user says hi, greet them warmly by name if known. If you don't know their name, ask how you can help them.",
-        "Use get_my_appointments tool to check the customer's existing appointments. Always provide this information to the customer - never say you don't know if they ask about their appointments.",
-        "Use book_appointment tool to book appointments. Use get_availability to check open slots.",
-        "NEVER call handoff_to_human just because you're unsure - check the tools first. Only escalate to human for explicit requests, serious complaints, or policy violations.",
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     },
     {
       role: "system",
       content:
-        "Business knowledge snippets:\n" +
+        // Label these clearly as reference material to prevent verbatim repetition
+        "REFERENCE KNOWLEDGE — use to answer questions naturally; NEVER repeat verbatim:\n" +
         (input.knowledge.length
           ? input.knowledge
               .map(
                 (hit, index) => `[${index + 1}] ${hit.title}: ${hit.content}`,
               )
               .join("\n\n")
-          : "No relevant snippets found."),
+          : "No knowledge snippets found."),
     },
     ...input.history.map(
       (item): ChatMessage => ({
@@ -337,7 +363,9 @@ async function aiReply(input: {
     ),
   ];
 
-  for (let turn = 0; turn < 2; turn += 1) {
+  // 5 turns: typical flows are get_appointments(1) → reply(2) or
+  // get_availability(1) → book(2) → reply(3). 2 was always too tight.
+  for (let turn = 0; turn < 5; turn += 1) {
     logger.debug({ turn }, "calling groq");
     const completion = await groq!.chat.completions.create({
       model: config.GROQ_MODEL,
@@ -401,40 +429,83 @@ async function fallbackReply(input: {
   businessId: string;
   customerId: string;
 }): Promise<ChatReply> {
-  const lower = input.text.toLowerCase();
+  const lower = input.text.toLowerCase().trim();
+  const isRU = input.language === "roman_urdu";
+  const isUR = input.language === "ur";
 
-  // Only trigger handoff for explicit cancellation requests, not for checking appointments
-  const isCancel =
-    /(cancel|reschedule|change|my appointments|what appointments|mera appointment|meri appointment|check|show)/i.test(
-      lower,
-    );
-  if (isCancel) return { text: "Let me check your appointments for you." };
-
-  const isBooking =
-    /(book|visit|meeting|consultation|schedule|reserve|waqt|appoint|chahiye|karna)/i.test(
-      lower,
-    );
-  if (isBooking && !isCancel) {
+  // ── 1. Greetings ───────────────────────────────────────────────────────────────────
+  if (/^(hi+|hello|hey|salam|assalam|namaste|aoa|aslam\s*u)\b/i.test(lower)) {
     return {
-      text: "Sure! What time would you like to book?",
+      text: isUR
+        ? "سلام! آپ کیسہ ہیں؟ Demo Clinic کا WhatsApp اسسٹنٹ کیا مدد کر سکتا ہڼوں؟"
+        : isRU
+          ? "Salam! Main Demo Clinic ka WhatsApp assistant hoon. Kya madad kar sakta hoon? 😊"
+          : "Hello! I'm the WhatsApp assistant for Demo Clinic. How can I help you today? 😊",
+    };
+  }
+
+  // ── 2. Inquiry about EXISTING appointments ("already booked", "my booking", etc.) ───
+  // IMPORTANT: check this BEFORE isBooking to prevent false booking prompt.
+  const isInquiry =
+    /(tell me|show me|what is my|my booking|booking detail|appointment detail|already book|i have book|i book|maine book|mera appointment|meri appointment|apna appointment|appoint.*status|appoint.*detail|detail.*appoint|check.*appoint|what.*appoint|my appoint|mujhe.*appoint)/i.test(
+      lower,
+    );
+  if (isInquiry) {
+    return {
+      text:
+        isRU || isUR
+          ? "Aap ke appointments check kar raha hoon. Agar koi appointment hai to abhi bata deta hoon."
+          : "Let me look up your appointments. I’ll share any upcoming bookings right away. If you don’t have one yet, I can help you book! 🗓️",
+    };
+  }
+
+  // ── 3. Cancel / reschedule ────────────────────────────────────────────────────────
+  if (
+    /(cancel|reschedule|change.*appoint|appoint.*cancel|appoint.*change)/i.test(
+      lower,
+    )
+  ) {
+    return {
+      text:
+        isRU || isUR
+          ? "Appointment cancel ya reschedule karne ke liye date aur time batayein."
+          : "To cancel or reschedule, please provide the date and time of your appointment.",
+    };
+  }
+
+  // ── 4. New booking intent OR time-only continuation message ─────────────────────
+  // Catches:
+  //   a) Explicit booking keywords ("book", "consult", "appointment", …)
+  //   b) Continuation time messages after a booking conversation
+  //      ("tomor 2 pm", "10 30 am", "kal 5 bjy") that have no booking keyword
+  //      but are clearly a time/date reply.
+  const hasBookingKeyword =
+    /(book|visit|meeting|consult|schedule|reserve|waqt|appoint|chahiye|karna|available|slot)/i.test(
+      lower,
+    );
+  const hasTimeOrDate =
+    /\b\d{1,2}\s*(?:[:. ]\s*\d{2})?\s*(?:am|pm|bjy|baje|bje)\b/i.test(lower) ||
+    /\b(tomorrow|tomor|tmrw?|tmr|2mrw?|kal|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(
+      lower,
+    );
+
+  if (hasBookingKeyword || hasTimeOrDate) {
+    return {
+      text:
+        isRU || isUR
+          ? "Zaroor! Kab ka appointment chahiye? Date aur time batayein, maslan: kal 3 baje."
+          : "Sure! What date and time would you like? For example: tomorrow at 3 PM or Wednesday at 10 AM. 🗓️",
       metadata: { bookingIntent: true },
     };
   }
 
-  const knowledge = await safeSearchKnowledge(input.businessId, input.text, 1);
-  if (knowledge[0]) {
-    return {
-      text: knowledge[0].content.slice(0, 900),
-      metadata: { fallback: true },
-    };
-  }
-
+  // ── 5. Generic fallback — NEVER return raw knowledge text ───────────────────────
   return {
-    text:
-      input.language === "ur"
-        ? "Shukriya! Is bare mein hamari team aap ko jald reply karegi."
-        : "Thanks! Our team will reply shortly with the right details.",
-    handoff: true,
+    text: isUR
+      ? "Shukriya Demo Clinic se rabta karne ka! Appointment, clinic hours ya kisi aur cheez ke bare mein pooch saktay hain."
+      : isRU
+        ? "Shukriya! Appointment book karna ho ya clinic ki info chahiye, batayein. Hum madad karenge! 😊"
+        : "Thanks for reaching out to Demo Clinic! I can help with appointments, clinic hours, or any questions. What do you need? 😊",
   };
 }
 
@@ -447,20 +518,21 @@ async function tryDeterministicBooking(input: {
 }): Promise<ChatReply | null> {
   const lower = input.text.toLowerCase();
 
-  // Explicitly exit deterministic handler early for checks or cancellations
-  const isCancel =
-    /(cancel|reschedule|change|my appointments|what appointments|mera appointment|meri appointment|check|show)/i.test(
+  // Exit deterministic handler for lookups, cancellations, and inquiries—let AI handle them.
+  const isLookup =
+    /(cancel|reschedule|my\s+appointment|what\s+appointment|mera\s+appointment|meri\s+appointment|my\s+booking|booking\s+detail|appointment\s+detail|already\s+book|i\s+have\s+book|i\s+book|appoint.*status|tell\s+me.*appoint|check.*appoint)/i.test(
       lower,
     );
-  if (isCancel) return null;
+  if (isLookup) return null;
 
+  // "consult" prefix matches "consultation", "consulting", AND typos like "consultantation"
   const isBooking =
-    /(visit|meeting|consultation|schedule|reserve|waqt|appoint|chahiye|karna|book)/i.test(
+    /(visit|meeting|consult|schedule|reserve|waqt|appoint|chahiye|karna|book|available|slot)/i.test(
       lower,
     );
 
   // Only attempt deterministic booking if there is a date parseable OR if they definitely asked to book
-  if (isBooking && !isCancel) {
+  if (isBooking) {
     const startsAt = parseLooseDateTime(input.text, new Date(), input.timeZone);
     if (!startsAt) {
       return null;
