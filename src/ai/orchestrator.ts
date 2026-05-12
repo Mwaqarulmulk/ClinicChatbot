@@ -514,57 +514,7 @@ async function fallbackReply(input: {
     };
   }
 
-  // ── 2. Appointment INQUIRY — make a REAL DB lookup, no placeholders ───────────────
-  // Require at least one appointment/booking keyword alongside the query word
-  // to avoid "tell me about services" hitting this branch.
-  const hasQueryWord =
-    /(tell me|show me|what is my|check|view|see|give me)/i.test(lower);
-  const hasAptWord =
-    /(appoint|booking|schedule|my time|my slot|mera appoint|meri appoint)/i.test(
-      lower,
-    );
-  const alreadyBookedPhrase =
-    /(already book|i have book|i book|maine book|mujhe.*appoint|my appoint|appoint.*detail|booking.*detail)/i.test(
-      lower,
-    );
-
-  if ((hasQueryWord && hasAptWord) || alreadyBookedPhrase) {
-    try {
-      const upcomingApts = await getCustomerAppointments({
-        businessId: input.businessId,
-        customerId: input.customerId,
-      });
-      if (upcomingApts.length === 0) {
-        return {
-          text:
-            isRU || isUR
-              ? "Aap ke abhi koi upcoming appointments nahi hain. Kya main ek book kar doon? \ud83d\uddd3\ufe0f"
-              : "You don't have any upcoming appointments right now. Would you like to book one? \ud83d\uddd3\ufe0f",
-        };
-      }
-      const list = upcomingApts
-        .map(
-          (a) =>
-            `\u2022 ${formatLocal(new Date(a.startsAt), config.DEFAULT_TIMEZONE)} \u2014 ${a.service}`,
-        )
-        .join("\n");
-      return {
-        text:
-          (isRU || isUR
-            ? "Aap ke upcoming appointments:\n"
-            : "Your upcoming appointments:\n") + list,
-      };
-    } catch {
-      return {
-        text:
-          isRU || isUR
-            ? "Appointments check karne mein masla aaya. Dobara try karein."
-            : "Couldn't load appointments right now. Please try again in a moment.",
-      };
-    }
-  }
-
-  // ── 3. Cancel / reschedule — show existing appointments first ────────────────────
+  // ── 2. Cancel / reschedule — check BEFORE inquiry so "cancel my appointment" routes here ──
   if (
     /(cancel|reschedule|change.*appoint|appoint.*cancel|appoint.*change)/i.test(
       lower,
@@ -600,6 +550,57 @@ async function fallbackReply(input: {
           isRU || isUR
             ? "Appointment cancel karne ke liye date aur time batayein."
             : "To cancel, please provide your appointment date and time.",
+      };
+    }
+  }
+
+  // ── 3. Appointment INQUIRY — real DB lookup, no placeholder text ───────────────
+  // Require BOTH a query word AND an appointment word to avoid "tell me about
+  // services" being routed here.
+  const hasQueryWord =
+    /(tell me|show me|what is my|check|view|see|give me)/i.test(lower);
+  const hasAptWord =
+    /(appoint|booking|schedule|my time|my slot|mera appoint|meri appoint)/i.test(
+      lower,
+    );
+  // Phrases that unambiguously reference an existing appointment
+  const alreadyBookedPhrase =
+    /(already book|i have book|i book|maine book|mujhe.*appoint|appoint.*detail|booking.*detail)/i.test(
+      lower,
+    );
+
+  if ((hasQueryWord && hasAptWord) || alreadyBookedPhrase) {
+    try {
+      const upcomingApts = await getCustomerAppointments({
+        businessId: input.businessId,
+        customerId: input.customerId,
+      });
+      if (upcomingApts.length === 0) {
+        return {
+          text:
+            isRU || isUR
+              ? "Aap ke abhi koi upcoming appointments nahi hain. Kya main ek book kar doon? \ud83d\uddd3\ufe0f"
+              : "You don't have any upcoming appointments right now. Would you like to book one? \ud83d\uddd3\ufe0f",
+        };
+      }
+      const list = upcomingApts
+        .map(
+          (a) =>
+            `\u2022 ${formatLocal(new Date(a.startsAt), config.DEFAULT_TIMEZONE)} \u2014 ${a.service}`,
+        )
+        .join("\n");
+      return {
+        text:
+          (isRU || isUR
+            ? "Aap ke upcoming appointments:\n"
+            : "Your upcoming appointments:\n") + list,
+      };
+    } catch {
+      return {
+        text:
+          isRU || isUR
+            ? "Appointments check karne mein masla aaya. Dobara try karein."
+            : "Couldn't load appointments right now. Please try again in a moment.",
       };
     }
   }
