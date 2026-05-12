@@ -205,11 +205,13 @@ export function createApp(transport: WhatsAppTransport) {
   /* ── HELPERS ────────────────────────────────────────────── */
   function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
   function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
-  function grow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,130)+'px';}
-  function scrollDown(){var c=document.getElementById('chat');c.scrollTop=c.scrollHeight;}
-  function handleKey(e){
-    if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}
-  }
+  // grow and handleKey MUST be on window — they are called from inline
+  // oninput/onkeydown attributes which only resolve to global scope.
+  window.grow=function(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,130)+'px';};
+  function grow(el){window.grow(el);}
+  window.handleKey=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(window.send)window.send();}};
+  function handleKey(e){window.handleKey(e);}
+  function scrollDown(){var c=document.getElementById('chat');if(c)c.scrollTop=c.scrollHeight;}
 
   /* ── HEALTH POLL ─────────────────────────────────────────── */
   function pollHealth(){
@@ -1110,18 +1112,26 @@ function landingPageHtml(): string {
     @keyframes cwPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
 
     /* ─── CHAT PANEL ───────────────────────────────────────────────────── */
+    /* Use display:none as the primary show/hide — reliable in all browsers.
+       The animation is a progressive enhancement via .cw-open-anim class. */
     #cw-panel{
+      display:none;   /* HIDDEN by default — toggled to flex by cwToggle() */
       position:fixed;bottom:96px;right:24px;z-index:9998;
       width:390px;height:580px;
       background:#1a1d2e;border-radius:20px;
       box-shadow:0 24px 80px rgba(0,0,0,.7),0 0 0 1px rgba(99,102,241,.2);
-      display:flex;flex-direction:column;overflow:hidden;
-      transform:translateY(20px) scale(.95);opacity:0;
-      pointer-events:none;transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;
+      flex-direction:column;overflow:hidden;
     }
-    #cw-panel.open{transform:translateY(0) scale(1);opacity:1;pointer-events:all}
+    /* Panel is shown by setting display:flex via JS, then animation class plays */
+    #cw-panel.cw-open-anim{
+      animation:cwSlideIn .25s cubic-bezier(.34,1.56,.64,1) both;
+    }
+    @keyframes cwSlideIn{
+      from{transform:translateY(20px) scale(.95);opacity:0}
+      to{transform:translateY(0) scale(1);opacity:1}
+    }
     @media(max-width:480px){
-      #cw-panel{right:0;bottom:0;width:100%;height:100dvh;border-radius:0}
+      #cw-panel{right:0;bottom:0;width:100%;height:100dvh;border-radius:0;border-radius:0}
       #cw-launcher{bottom:16px;right:16px}
     }
 
@@ -1246,7 +1256,7 @@ function landingPageHtml(): string {
     <!-- Input -->
     <div class="cp-ibar">
       <div class="cp-iwrap">
-        <textarea id="cw-inp" rows="1" placeholder="Ask me anything..." onkeydown="cwKey(event)" oninput="cwGrow(this)"></textarea>
+        <textarea id="cw-inp" rows="1" placeholder="Ask me anything..." onkeydown="cwKey(event)" oninput="cwGrow(this)" style="width:100%"></textarea>
         <button id="cw-send" onclick="cwSend()" title="Send">
           <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
         </button>
@@ -1257,8 +1267,12 @@ function landingPageHtml(): string {
   <script>
   (function(){
     /* ─ CONFIG ────────────────────────────────────────────── */
-    var from = 'web_' + (localStorage.getItem('cw_from') || (Date.now().toString(36)));
-    localStorage.setItem('cw_from', from.replace('web_',''));
+    // Wrap localStorage in try-catch — it throws in private/incognito mode
+    // on some browsers. If it fails, use in-memory state only.
+    var _lsGet = function(k){try{return localStorage.getItem(k);}catch(e){return null;}};
+    var _lsSet = function(k,v){try{localStorage.setItem(k,v);}catch(e){}};
+    var from = 'web_' + (_lsGet('cw_from') || (Date.now().toString(36)));
+    _lsSet('cw_from', from.replace('web_',''));
     var userName = '';
     var isOpen = false;
     var isSending = false;
@@ -1282,11 +1296,14 @@ function landingPageHtml(): string {
     /* ─ HELPERS ──────────────────────────────────────── */
     function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
     function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');}
-    function scrollEnd(){var m=document.getElementById('cw-msgs');m.scrollTop=m.scrollHeight;}
-    function cwGrow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,90)+'px';}
-    function cwKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();cwSend();}}
-    function saveSK(){try{localStorage.setItem(SK,JSON.stringify(msgStore.slice(-80)));}catch(e){}}
-    function loadSK(){try{var s=localStorage.getItem(SK);if(s)msgStore=JSON.parse(s);}catch(e){msgStore=[];}}
+    function scrollEnd(){var m=document.getElementById('cw-msgs');if(m)m.scrollTop=m.scrollHeight;}
+    // cwGrow and cwKey MUST be on window — called from inline oninput/onkeydown
+    window.cwGrow=function(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,90)+'px';};
+    function cwGrow(el){window.cwGrow(el);}
+    window.cwKey=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(window.cwSend)window.cwSend();}};
+    function cwKey(e){window.cwKey(e);}
+    function saveSK(){_lsSet(SK,JSON.stringify(msgStore.slice(-80)));}
+    function loadSK(){var s=_lsGet(SK);try{if(s)msgStore=JSON.parse(s);}catch(e){msgStore=[];}}
 
     /* ─ HEALTH POLL ────────────────────────────────────── */
     function pollHealth(){
@@ -1303,16 +1320,31 @@ function landingPageHtml(): string {
     pollHealth();
     setInterval(pollHealth,30000);
 
-    /* ─ TOGGLE ──────────────────────────────────────────── */
+    /* ─ TOGGLE ─────────────────────────────────────────── */
     window.cwToggle=function(){
       isOpen=!isOpen;
-      document.getElementById('cw-panel').classList.toggle('open',isOpen);
-      document.getElementById('cw-launcher').classList.toggle('open',isOpen);
+      var panel=document.getElementById('cw-panel');
+      var launcher=document.getElementById('cw-launcher');
+      var badge=document.getElementById('cw-badge');
+      if(!panel||!launcher)return;
       if(isOpen){
-        document.getElementById('cw-badge').style.display='none';
+        // Show: set display:flex then play slide-in animation
+        panel.style.display='flex';
+        panel.classList.add('cw-open-anim');
+        launcher.classList.add('open');
+        if(badge)badge.style.display='none';
         hasUnread=false;
-        if(msgStore.length===0) cwInit();
-        setTimeout(function(){document.getElementById('cw-inp').focus();},260);
+        if(msgStore.length===0)cwInit();
+        setTimeout(function(){
+          var inp=document.getElementById('cw-inp');
+          if(inp)inp.focus();
+        },260);
+      } else {
+        // Hide: remove display
+        panel.style.display='none';
+        panel.classList.remove('cw-open-anim');
+        launcher.classList.remove('open');
+        if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
       }
     };
 
@@ -1410,7 +1442,7 @@ function landingPageHtml(): string {
       if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
       isSending=false;cwRemoveTyping();
       from='web_'+Date.now().toString(36);
-      localStorage.setItem('cw_from',from.replace('web_',''));
+      _lsSet('cw_from',from.replace('web_',''));
       userName='';
       msgStore=[];
       var msgs=document.getElementById('cw-msgs');
@@ -1471,10 +1503,10 @@ function landingPageHtml(): string {
     };
 
     // Auto-open after 3 seconds on first visit to grab attention
-    if(!localStorage.getItem('cw_visited')){
+    if(!_lsGet('cw_visited')){
       setTimeout(function(){
-        if(!isOpen)cwToggle();
-        localStorage.setItem('cw_visited','1');
+        if(!isOpen&&window.cwToggle)window.cwToggle();
+        _lsSet('cw_visited','1');
       },3000);
     }
   })();
