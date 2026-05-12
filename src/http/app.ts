@@ -63,94 +63,119 @@ export function createApp(transport: WhatsAppTransport) {
     );
   });
 
-  // ── WhatsApp chat test UI ─────────────────────────────────────────────────────────────────────────────
+  // ── MegiBot-style AI chatbot widget ────────────────────────────────────────────────────────
   app.get("/chat/test", (c) =>
     c.html(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WhatsApp Chatbot Test</title>
+  <title>Demo Clinic AI Chat</title>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    html,body{height:100%;overflow:hidden}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#111b21;display:flex;flex-direction:column}
+    html{height:100%}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0d0b1e 0%,#1a0f35 40%,#0a0a18 100%);min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;gap:0}
+    /* ═══ WIDGET SHELL ═══ */
+    .widget{width:100%;max-width:400px;height:min(660px,90dvh);background:#1a1d2e;border-radius:20px;display:flex;flex-direction:column;box-shadow:0 30px 90px rgba(0,0,0,.65),0 0 0 1px rgba(99,102,241,.18);overflow:hidden}
     /* HEADER */
-    .header{background:#202c33;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;border-bottom:1px solid #2d3f4b}
-    .avatar{width:40px;height:40px;border-radius:50%;background:#25d366;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
-    .hinfo{flex:1;min-width:0}
-    .hname{font-size:15px;font-weight:600;color:#e9edef}
-    .hstatus{font-size:12px;color:#25d366;display:flex;align-items:center;gap:5px}
-    .hstatus-dot{width:7px;height:7px;border-radius:50%;background:#25d366}
-    .hlinks{display:flex;gap:8px}
-    .hlink{font-size:12px;padding:5px 10px;border-radius:14px;border:1px solid #2d3f4b;color:#8696a0;text-decoration:none;white-space:nowrap}
-    .hlink:hover{border-color:#25d366;color:#25d366}
-    /* SETTINGS BAR */
-    .sbar{background:#1a2530;padding:8px 16px;display:flex;gap:10px;align-items:center;flex-shrink:0;flex-wrap:wrap;border-bottom:1px solid #2d3f4b}
-    .sbar label{font-size:11px;color:#8696a0;white-space:nowrap}
-    .sbar input{background:#2a3942;border:none;border-radius:6px;padding:5px 10px;color:#e9edef;font:inherit;font-size:13px;width:160px;outline:none}
-    .sbtn{font-size:11px;padding:5px 10px;border-radius:12px;border:1px solid #2d3f4b;background:transparent;color:#8696a0;cursor:pointer;white-space:nowrap}
-    .sbtn:hover{border-color:#25d366;color:#25d366}
-    /* CHAT AREA */
-    #chat{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:3px;background:#0b141a}
-    /* WhatsApp wallpaper pattern */
-    #chat{background-color:#0b141a;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Cpath fill='%23182229' fill-opacity='.35' d='M0 0h40v40H0zm40 40h40v40H40z'/%3E%3C/svg%3E")}
-    .day-sep{text-align:center;margin:8px 0}
-    .day-sep span{background:#1f2c34;color:#8696a0;padding:3px 12px;border-radius:6px;font-size:11px}
-    .row{display:flex;margin-bottom:1px}
-    .row.user{justify-content:flex-end}
-    .row.bot{justify-content:flex-start}
-    .bubble{max-width:72%;padding:7px 12px 5px;border-radius:8px;font-size:14px;line-height:1.45;word-break:break-word;position:relative}
-    .bubble.user{background:#005c4b;color:#e9edef;border-radius:8px 0 8px 8px}
-    .bubble.bot{background:#202c33;color:#e9edef;border-radius:0 8px 8px 8px}
-    .bubble.sys{background:rgba(255,255,255,.07);color:#8696a0;font-size:12px;text-align:center;border-radius:8px;max-width:90%;margin:4px auto}
-    .btime{font-size:10px;color:rgba(255,255,255,.45);margin-top:3px;text-align:right}
-    .tick{font-size:10px;margin-left:3px}
-    /* typing */
-    .typing{display:inline-flex;align-items:center;gap:3px;background:#202c33;border-radius:0 8px 8px 8px;padding:10px 14px}
-    .tdot{width:7px;height:7px;border-radius:50%;background:#8696a0;animation:tbounce 1.4s infinite both}
+    .hdr{background:linear-gradient(175deg,#2e2a55 0%,#1e1b40 100%);padding:14px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.05)}
+    .hdr-avatar{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,#8b5cf6,#6366f1,#3b82f6);display:flex;align-items:center;justify-content:center;font-size:23px;flex-shrink:0;box-shadow:0 4px 14px rgba(99,102,241,.4)}
+    .hdr-info{flex:1;min-width:0}
+    .hdr-name{color:#fff;font-size:15px;font-weight:700;letter-spacing:.01em}
+    .hdr-status{display:flex;align-items:center;gap:5px;margin-top:2px}
+    .hdr-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e}
+    .hdr-txt{font-size:12px;color:#22c55e;font-weight:500}
+    .hdr-btns{display:flex;gap:6px}
+    .hdr-btn{width:30px;height:30px;border:none;border-radius:8px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.55);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px;text-decoration:none;transition:background .15s;line-height:1}
+    .hdr-btn:hover{background:rgba(255,255,255,.16);color:#fff}
+    /* MESSAGES */
+    #chat{flex:1;overflow-y:auto;padding:14px 14px 6px;display:flex;flex-direction:column;gap:2px;scrollbar-width:thin;scrollbar-color:rgba(99,102,241,.2) transparent}
+    #chat::-webkit-scrollbar{width:3px}#chat::-webkit-scrollbar-thumb{background:rgba(99,102,241,.25);border-radius:2px}
+    .row{display:flex;flex-direction:column;margin-bottom:2px}
+    .row.user{align-items:flex-end}.row.bot{align-items:flex-start}
+    .bubble{max-width:80%;padding:11px 15px;font-size:14px;line-height:1.55;word-break:break-word}
+    .bubble.bot{background:#252a42;color:#dde1f0;border-radius:18px 18px 18px 5px}
+    .bubble.user{background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border-radius:18px 18px 5px 18px}
+    .bubble.sys{background:rgba(255,255,255,.04);color:rgba(255,255,255,.35);font-size:11px;border-radius:8px;text-align:center;max-width:100%;padding:5px 10px}
+    .msg-time{font-size:10px;color:rgba(255,255,255,.22);margin-top:3px;padding:0 3px}
+    /* BOOKING CARD */
+    .book-card{max-width:80%;background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.22);border-radius:14px;overflow:hidden}
+    .book-card-hd{background:rgba(34,197,94,.14);padding:7px 14px;font-size:11px;font-weight:700;color:#4ade80;letter-spacing:.05em}
+    .book-card-bd{padding:10px 14px;font-size:13.5px;color:#dde1f0;line-height:1.5}
+    .book-card-id{padding:0 14px 9px;font-size:10px;color:rgba(255,255,255,.2)}
+    /* TYPING */
+    .typing-row{display:flex;margin-bottom:2px}
+    .typing-bbl{background:#252a42;border-radius:18px 18px 18px 5px;padding:12px 16px;display:inline-flex;gap:5px;align-items:center}
+    .tdot{width:7px;height:7px;background:#6366f1;border-radius:50%;animation:tbounce 1.2s ease-in-out infinite both}
     .tdot:nth-child(2){animation-delay:.2s}.tdot:nth-child(3){animation-delay:.4s}
-    @keyframes tbounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
+    @keyframes tbounce{0%,60%,100%{transform:translateY(0);opacity:.3}30%{transform:translateY(-8px);opacity:1}}
     /* HANDOFF BANNER */
-    .handoff-banner{background:rgba(210,153,34,.15);border:1px solid rgba(210,153,34,.35);color:#d29922;border-radius:8px;padding:8px 14px;font-size:12px;text-align:center;margin:4px 0}
+    .handoff-banner{border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.07);color:#fbbf24;border-radius:10px;padding:7px 13px;font-size:12px;text-align:center}
+    /* DAY SEPARATOR */
+    .day-sep{text-align:center;padding:8px 0}
+    .day-sep span{font-size:11px;color:rgba(255,255,255,.18);background:rgba(255,255,255,.04);padding:3px 10px;border-radius:8px}
     /* SUGGESTIONS */
-    #suggestions{display:none;flex-wrap:wrap;gap:6px;padding:8px 14px;background:#111b21;border-top:1px solid #2d3f4b;flex-shrink:0}
-    .chip{background:#1f2c34;border:1px solid #2d3f4b;border-radius:16px;padding:5px 12px;font-size:12px;color:#8696a0;cursor:pointer;white-space:nowrap;transition:.15s;font-family:inherit}
-    .chip:hover{border-color:#25d366;color:#25d366}
+    #suggestions{display:none;flex-wrap:wrap;gap:7px;padding:10px 14px;flex-shrink:0}
+    .chip{border:1px solid rgba(99,102,241,.32);background:rgba(99,102,241,.06);color:#a5b4fc;border-radius:20px;padding:6px 15px;font-size:12.5px;cursor:pointer;font-family:inherit;transition:all .15s;line-height:1.3}
+    .chip:hover{background:rgba(99,102,241,.2);border-color:#6366f1;color:#fff}
     /* INPUT */
-    .ibar{background:#202c33;padding:8px 12px;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
-    #msg{flex:1;background:#2a3942;border:none;border-radius:20px;padding:9px 16px;color:#e9edef;font:inherit;font-size:14px;resize:none;outline:none;max-height:130px;line-height:1.45}
-    .send-btn{width:46px;height:46px;border-radius:50%;background:#25d366;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;transition:.15s}
-    .send-btn:hover{background:#1aab53}
-    .send-btn:disabled{background:#2a3942;cursor:not-allowed}
-    @media(max-width:500px){.bubble{max-width:88%}.sbar input{width:120px}}
+    .ibar{padding:10px 14px 14px;flex-shrink:0}
+    .input-wrap{display:flex;align-items:center;background:#252a42;border-radius:26px;border:1.5px solid rgba(99,102,241,.15);padding:5px 5px 5px 16px;gap:8px;transition:border-color .2s}
+    .input-wrap:focus-within{border-color:rgba(99,102,241,.55);box-shadow:0 0 0 3px rgba(99,102,241,.08)}
+    #msg{flex:1;background:transparent;border:none;color:#dde1f0;font:inherit;font-size:14px;outline:none;resize:none;max-height:100px;line-height:1.5;padding:5px 0}
+    #msg::placeholder{color:rgba(255,255,255,.25)}
+    .send-btn{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 12px rgba(99,102,241,.45);transition:transform .15s,opacity .15s}
+    .send-btn:hover{transform:scale(1.07)}
+    .send-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+    .send-btn svg{width:16px;height:16px;fill:#fff}
+    /* SETTINGS STRIP */
+    .sbar{display:flex;gap:8px;align-items:center;justify-content:center;padding:10px 0 6px;flex-wrap:wrap}
+    .sbar label{font-size:11px;color:rgba(255,255,255,.25)}
+    .sbar input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:4px 10px;color:rgba(255,255,255,.55);font:inherit;font-size:12px;width:130px;outline:none}
+    .sbar input:focus{border-color:rgba(99,102,241,.5)}
+    .sbtn{background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.22);color:#a5b4fc;border-radius:8px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer;transition:background .15s}
+    .sbtn:hover{background:rgba(99,102,241,.22)}
+    .bnav{display:flex;gap:16px;justify-content:center;padding:4px 0 12px}
+    .bnav a{color:rgba(255,255,255,.18);font-size:11px;text-decoration:none;transition:color .15s}
+    .bnav a:hover{color:rgba(255,255,255,.5)}
+    @media(max-width:440px){body{padding:0;justify-content:flex-start;background:#0d0b1e}.widget{max-width:100%;border-radius:0;height:100dvh}.sbar,.bnav{display:none}}
   </style>
 </head>
 <body>
-<div class="header">
-  <div class="avatar">🏥</div>
-  <div class="hinfo">
-    <div class="hname">Demo Clinic Assistant</div>
-    <div class="hstatus"><span class="hstatus-dot"></span><span id="statusTxt">checking...</span></div>
+<div class="widget">
+  <div class="hdr">
+    <div class="hdr-avatar">🏥</div>
+    <div class="hdr-info">
+      <div class="hdr-name">Demo Clinic AI</div>
+      <div class="hdr-status"><span class="hdr-dot" id="sDot"></span><span class="hdr-txt" id="statusTxt">Connecting...</span></div>
+    </div>
+    <div class="hdr-btns">
+      <button class="hdr-btn" onclick="newUser()" title="New conversation">🔄</button>
+      <button class="hdr-btn" onclick="clearChat()" title="Clear">&#128465;</button>
+      <a class="hdr-btn" href="/admin" title="Admin">⚙</a>
+    </div>
   </div>
-  <div class="hlinks">
-    <a class="hlink" href="/">🏠 Home</a>
-    <a class="hlink" href="/admin">⚙️ Admin</a>
+  <div id="chat"></div>
+  <div id="suggestions"></div>
+  <div class="ibar">
+    <div class="input-wrap">
+      <textarea id="msg" rows="1" placeholder="Ask me anything..." onkeydown="handleKey(event)" oninput="grow(this)"></textarea>
+      <button class="send-btn" id="sendBtn" onclick="send()" title="Send">
+        <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
+      </button>
+    </div>
   </div>
 </div>
 <div class="sbar">
-  <label>Phone:</label><input id="fromIn" value="923001234573" />
-  <label>Name:</label><input id="nameIn" value="Test User" />
-  <button class="sbtn" onclick="newUser()">👤 New User</button>
-  <button class="sbtn" onclick="clearChat()">🗑 Clear</button>
+  <label>Phone</label><input id="fromIn" value="923001234573" />
+  <label>Name</label><input id="nameIn" value="Test User" style="width:100px" />
+  <button class="sbtn" onclick="newUser()">+ New User</button>
+  <button class="sbtn" onclick="clearChat()">Clear</button>
 </div>
-<div id="chat">
-  <!-- messages rendered by JS / restored from localStorage -->
-</div>
-<div id="suggestions"><!-- quick-tap chips, shown by JS --></div>
-<div class="ibar">
-  <textarea id="msg" rows="1" placeholder="Type a message..." onkeydown="handleKey(event)" oninput="grow(this)"></textarea>
-  <button class="send-btn" id="sendBtn" onclick="send()" title="Send">➤</button>
+<div class="bnav">
+  <a href="/">🏠 Home</a>
+  <a href="/admin">⚙️ Admin</a>
+  <a href="/health">❤️ Status</a>
 </div>
 <script>
 (function(){
@@ -159,7 +184,7 @@ export function createApp(transport: WhatsAppTransport) {
   var name = document.getElementById('nameIn').value;
   var isSending = false;       // guards against concurrent sends
   var abortCtrl = null;        // AbortController for current in-flight fetch
-  var STORAGE_KEY = 'chatHistory_v1';
+  var STORAGE_KEY = 'chatHistory_v3';
   var lastSendTime = 0;
   var MIN_SEND_GAP = 600;      // ms minimum between requests (avoids Groq rate-limit spikes)
 
@@ -175,10 +200,13 @@ export function createApp(transport: WhatsAppTransport) {
   /* ── HEALTH POLL ─────────────────────────────────────────── */
   function pollHealth(){
     fetch('/health').then(function(r){return r.json();}).then(function(d){
-      var el=document.getElementById('statusTxt');
-      var dot=document.querySelector('.hstatus-dot');
-      el.textContent=d.whatsappReady?'online':'AI mode';
-      dot.style.background=d.whatsappReady?'#25d366':'#d29922';
+      var txt=document.getElementById('statusTxt');
+      var dot=document.getElementById('sDot');
+      if(!txt||!dot)return;
+      txt.textContent=d.whatsappReady?'Online':'AI Mode';
+      txt.style.color=d.whatsappReady?'#22c55e':'#f59e0b';
+      dot.style.background=d.whatsappReady?'#22c55e':'#f59e0b';
+      dot.style.boxShadow='0 0 6px '+(d.whatsappReady?'#22c55e':'#f59e0b');
     }).catch(function(){});
   }
   pollHealth();
@@ -186,14 +214,14 @@ export function createApp(transport: WhatsAppTransport) {
 
   /* ── SUGGESTIONS ────────────────────────────────────────── */
   var SUGGESTIONS=[
-    '👋 Hi',
-    '🗓 Book appointment tomorrow 10am',
-    '📝 Tell me my appointments',
-    '💰 What is the consultation fee?',
-    '🧑\u200d⚕️ What services do you offer?',
-    '📍 Where is the clinic?',
-    '⏰ What are the clinic hours?',
-    '❌ Cancel my appointment',
+    '👋 Hi there!',
+    '🗓 Book an appointment',
+    '📝 My appointments',
+    '💰 Consultation fees',
+    '🧑\u200d⚕️ Services offered',
+    '📍 Clinic location',
+    '⏰ Opening hours',
+    '❌ Cancel appointment',
   ];
   function showSuggestions(){
     var el=document.getElementById('suggestions');
@@ -228,7 +256,8 @@ export function createApp(transport: WhatsAppTransport) {
     var chat=document.getElementById('chat');
     chat.innerHTML='<div class="day-sep"><span>Today</span></div>';
     if(msgStore.length===0){
-      chat.innerHTML+='<div class="row bot"><div class="bubble bot">Hi! I\u2019m the Demo Clinic assistant. 😊 How can I help you today?<div class="btime">'+now()+'</div></div></div>';
+      // MegiBot-style welcome
+      renderBubble('bot','Good day! \ud83d\udc4b I\u2019m Demo Clinic AI, your intelligent health assistant.\n\nI can help you with:\n\u2022 Appointments & Bookings\n\u2022 Services & Fees\n\u2022 Doctor Information\n\u2022 Clinic Hours & Location\n\nWhat can I help you with today? \ud83d\ude0a','',now(),false);
       showSuggestions();
     } else {
       msgStore.forEach(function(m){renderBubble(m.role,m.text,m.extra,m.time,false);});
@@ -247,7 +276,8 @@ export function createApp(transport: WhatsAppTransport) {
     } else if(role==='card'){
       row.innerHTML=text; // pre-built HTML card
     } else {
-      row.innerHTML='<div class="bubble '+role+'">'+esc(text)+(extra||'')+'<div class="btime">'+(time||now())+'</div></div>';
+      row.innerHTML='<div class="bubble '+role+'">'+esc(text)+'</div>'
+        +'<div class="msg-time">'+(time||now())+'</div>';
     }
     chat.appendChild(row);
     if(save&&role!=='sys'&&role!=='card'){
@@ -266,12 +296,12 @@ export function createApp(transport: WhatsAppTransport) {
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
     row.className='row bot';
-    row.innerHTML='<div class="bubble bot" style="padding:0;overflow:hidden;">'
-      +'<div style="background:rgba(37,211,102,.12);padding:10px 14px;border-bottom:1px solid rgba(37,211,102,.2);font-size:12px;color:#25d366;font-weight:700">✅ Appointment Confirmed</div>'
-      +'<div style="padding:10px 14px;">'+esc(text)+'</div>'
-      +(meta&&meta.appointmentId?'<div style="padding:2px 14px 10px;font-size:10px;color:rgba(255,255,255,.35)">ID: '+esc(meta.appointmentId)+'</div>':'')
-      +'<div class="btime" style="padding:0 14px 8px">'+now()+'</div>'
-      +'</div>';
+    row.innerHTML='<div class="book-card">'
+      +'<div class="book-card-hd">✅ APPOINTMENT CONFIRMED</div>'
+      +'<div class="book-card-bd">'+esc(text)+'</div>'
+      +(meta&&meta.appointmentId?'<div class="book-card-id">ID: '+esc(meta.appointmentId)+'</div>':'')
+      +'</div>'
+      +'<div class="msg-time">'+now()+'</div>';
     chat.appendChild(row);
     msgStore.push({role:'bot',text:text,extra:'',time:now()});
     saveToStorage();
@@ -283,8 +313,8 @@ export function createApp(transport: WhatsAppTransport) {
     if(document.getElementById('typing-row'))return; // idempotent
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
-    row.className='row bot';row.id='typing-row';
-    row.innerHTML='<div class="typing"><div class="tdot"></div><div class="tdot"></div><div class="tdot"></div></div>';
+    row.className='typing-row';row.id='typing-row';
+    row.innerHTML='<div class="typing-bbl"><div class="tdot"></div><div class="tdot"></div><div class="tdot"></div></div>';
     chat.appendChild(row);scrollDown();
   }
   function removeTyping(){var t=document.getElementById('typing-row');if(t)t.remove();}
@@ -319,8 +349,8 @@ export function createApp(transport: WhatsAppTransport) {
 
   function clearChatUI(){
     var chat=document.getElementById('chat');
-    chat.innerHTML='<div class="day-sep"><span>Today</span></div>'
-      +'<div class="row bot"><div class="bubble bot">Chat cleared. How can I help you? 😊<div class="btime">'+now()+'</div></div></div>';
+    chat.innerHTML='<div class="day-sep"><span>Today</span></div>';
+    renderBubble('bot','Chat cleared. How can I help you today? \ud83d\ude0a','',now(),false);
     showSuggestions();
   }
 
