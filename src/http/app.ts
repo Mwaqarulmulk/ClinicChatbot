@@ -403,11 +403,12 @@ export function createApp(transport: WhatsAppTransport) {
     });
   });
 
-  /** GET /admin/customers — paginated customer list */
+  /** GET /admin/customers — paginated customer list with appointment counts */
   app.get("/admin/customers", async (c) => {
     assertAdmin(c.req.header("x-admin-key"));
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
 
+    // Use LEFT JOIN + COUNT instead of correlated subquery for SQLite compatibility
     const rows = await db
       .select({
         id: customers.id,
@@ -415,10 +416,18 @@ export function createApp(transport: WhatsAppTransport) {
         name: customers.name,
         language: customers.language,
         createdAt: customers.createdAt,
-        appointmentCount: sql<number>`cast((select count(*) from appointments where appointments.customer_id = ${customers.id}) as integer)`,
+        appointmentCount: sql<number>`cast(count(${appointments.id}) as integer)`,
       })
       .from(customers)
+      .leftJoin(appointments, eq(appointments.customerId, customers.id))
       .where(eq(customers.businessId, businessId))
+      .groupBy(
+        customers.id,
+        customers.phone,
+        customers.name,
+        customers.language,
+        customers.createdAt,
+      )
       .orderBy(sql`${customers.createdAt} desc`)
       .limit(200);
 
