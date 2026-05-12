@@ -10,10 +10,6 @@ primary_region = 'ams'
   PORT = '8080'
   WHATSAPP_ENABLED = 'true'
 
-[[mounts]]
-  source = 'chatbot_data'
-  destination = '/app/.data'
-
 [http_service]
   auto_start_machines = true
   auto_stop_machines = true
