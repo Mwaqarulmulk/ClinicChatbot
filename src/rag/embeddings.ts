@@ -10,11 +10,25 @@ export async function embedText(text: string): Promise<number[]> {
           "content-type": "application/json",
           ...(config.EMBEDDING_API_KEY ? { authorization: `Bearer ${config.EMBEDDING_API_KEY}` } : {})
         },
-        body: JSON.stringify({ input: text })
+        body: JSON.stringify({
+          input: text,
+          model: "text-embedding-3-small",
+          dimensions: config.EMBEDDING_DIMENSIONS,
+        })
       });
       if (!response.ok) throw new Error(`embedding api ${response.status}`);
-      const json = (await response.json()) as { embedding?: number[]; data?: Array<{ embedding: number[] }> };
-      const embedding = json.embedding ?? json.data?.[0]?.embedding;
+      const json = (await response.json()) as {
+        embedding?: number[];
+        data?: Array<{ embedding: number[]; index: number }>;
+        output?: number[];
+      };
+      // Support multiple response formats:
+      // OpenAI: { data: [{ embedding: [...] }] }
+      // Direct: { embedding: [...] }
+      // Cohere: { embeddings: { float: [[...]] } }
+      const embedding = json.embedding
+        ?? json.data?.[0]?.embedding
+        ?? json.output;
       if (embedding?.length) return embedding;
     } catch (error) {
       logger.warn({ err: error }, "embedding api failed; using local fallback");

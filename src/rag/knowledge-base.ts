@@ -22,16 +22,25 @@ type KnowledgeRow = KnowledgeHit & {
 
 let connection: Awaited<ReturnType<typeof lancedb.connect>> | null = null;
 let initialized = false;
+let initFailed = false;
 
 async function getConnection() {
-  mkdirSync(config.LANCEDB_URI, { recursive: true });
-  connection ??= await lancedb.connect(config.LANCEDB_URI);
-  return connection;
+  if (initFailed) return null;
+  try {
+    mkdirSync(config.LANCEDB_URI, { recursive: true });
+    connection ??= await lancedb.connect(config.LANCEDB_URI);
+    return connection;
+  } catch (error) {
+    initFailed = true;
+    logger.warn({ err: error }, "lancedb connection failed; RAG disabled");
+    return null;
+  }
 }
 
 export async function initKnowledgeBase() {
-  if (initialized) return;
+  if (initialized || initFailed) return;
   const db = await getConnection();
+  if (!db) return; // initFailed is true
   try {
     await db.openTable(config.RAG_TABLE);
   } catch {
@@ -64,6 +73,7 @@ export async function upsertKnowledge(input: {
 }) {
   await initKnowledgeBase();
   const db = await getConnection();
+  if (!db) throw new Error("knowledge base unavailable");
   const table = await db.openTable(config.RAG_TABLE);
   const chunks = chunkText(input.content);
   const now = new Date().toISOString();
@@ -105,6 +115,7 @@ export async function searchKnowledge(input: {
 }): Promise<KnowledgeHit[]> {
   await initKnowledgeBase();
   const db = await getConnection();
+  if (!db) return []; // Graceful degradation — RAG unavailable
   const table = await db.openTable(config.RAG_TABLE);
   const vector = await embedText(input.query);
   const limit = input.limit ?? 4;
@@ -212,6 +223,7 @@ export async function searchKnowledgeByTitle(
 ): Promise<KnowledgeHit | null> {
   await initKnowledgeBase();
   const db = await getConnection();
+  if (!db) return null;
   const table = await db.openTable(config.RAG_TABLE);
   const rows = (await table.query().limit(2000).toArray()) as KnowledgeRow[];
   const lower = titleKeyword.toLowerCase();
@@ -231,6 +243,7 @@ export async function listKnowledge(
 ): Promise<KnowledgeHit[]> {
   await initKnowledgeBase();
   const db = await getConnection();
+  if (!db) return [];
   const table = await db.openTable(config.RAG_TABLE);
   const rows = (await table.query().limit(2000).toArray()) as KnowledgeRow[];
   return rows
@@ -250,6 +263,7 @@ export async function deleteKnowledgeByTitle(
 ): Promise<void> {
   await initKnowledgeBase();
   const db = await getConnection();
+  if (!db) return;
   const table = await db.openTable(config.RAG_TABLE);
   const escapedPrefix = `${businessId}:${titleSlug}`.replace(/'/g, "''");
   try {

@@ -62,6 +62,9 @@ const statements = [
     updated_at TEXT NOT NULL
   )`,
   sql`CREATE INDEX IF NOT EXISTS appointments_schedule_idx ON appointments (business_id, starts_at, status)`,
+  sql`CREATE UNIQUE INDEX IF NOT EXISTS appointments_active_slot_idx
+    ON appointments (business_id, starts_at)
+    WHERE status != 'cancelled'`,
   sql`CREATE TABLE IF NOT EXISTS analytics_events (
     id TEXT PRIMARY KEY,
     business_id TEXT NOT NULL,

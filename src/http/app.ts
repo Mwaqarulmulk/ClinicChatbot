@@ -3,15 +3,17 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { and, eq, gte, sql } from "drizzle-orm";
+import * as Sentry from "@sentry/node";
 import { config } from "../config";
 import { logger } from "../logger";
 import { handleInboundMessage } from "../ai/orchestrator";
+import { captureError } from "../monitoring/sentry";
 import {
   deleteKnowledgeByTitle,
   listKnowledge,
   upsertKnowledge,
 } from "../rag/knowledge-base";
-import { upcomingAppointments } from "../services/appointments";
+import { upcomingAppointments, clearBusinessCache } from "../services/appointments";
 import type { WhatsAppTransport } from "../types";
 import { WindowGuard } from "../utils/window-guard";
 import { db } from "../db/client";
@@ -25,15 +27,56 @@ import {
 export function createApp(transport: WhatsAppTransport) {
   const app = new Hono();
   const testChatGuard = new WindowGuard(30, 60_000);
+  const adminRateGuard = new WindowGuard(100, 60_000); // 100 admin requests per minute
+
+  // ── Security headers on every response ────────────────────────────────────
+  app.use("*", async (c, next) => {
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("X-Frame-Options", "DENY");
+    c.header("X-XSS-Protection", "0");
+    c.header("Referrer-Policy", "strict-origin-when-cross-origin");
+    c.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    await next();
+  });
+
+  // ── Sentry request handler (tracing) ──────────────────────────────────────
+  if (config.SENTRY_DSN) {
+    app.use("*", async (c, next) => {
+      const req = c.req.raw;
+      return Sentry.withIsolationScope(async (scope) => {
+        scope.setSDKProcessingMetadata({
+          request: req,
+        });
+        await next();
+      });
+    });
+  }
+
+  // ── Request logging middleware ─────────────────────────────────────────────
+  app.use("*", async (c, next) => {
+    const start = Date.now();
+    const method = c.req.method;
+    const path = c.req.path;
+    await next();
+    const ms = Date.now() - start;
+    const status = c.res.status;
+    if (status >= 500) {
+      logger.error({ method, path, status, ms }, "http request");
+    } else if (status >= 400) {
+      logger.warn({ method, path, status, ms }, "http request");
+    } else {
+      logger.debug({ method, path, status, ms }, "http request");
+    }
+  });
+
   // Restrict CORS to known origins — wildcard * allows any site to call admin APIs
   app.use(
     "*",
     cors({
       origin: (origin) => {
         if (!origin) return null; // same-origin requests have no Origin header
-        if (origin.includes("clinicchatbot.fly.dev")) return origin;
-        if (origin.includes("localhost") || origin.includes("127.0.0.1"))
-          return origin;
+        if (isAllowedOrigin(origin)) return origin;
         return null; // reject unknown origins
       },
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -49,6 +92,10 @@ export function createApp(transport: WhatsAppTransport) {
         400,
       );
     logger.error({ err: error }, "unhandled http error");
+    captureError(error, {
+      method: c.req.method,
+      path: c.req.path,
+    });
     return c.json({ ok: false, error: "internal_error" }, 500);
   });
 
@@ -56,27 +103,41 @@ export function createApp(transport: WhatsAppTransport) {
   app.get("/", (c) => c.html(landingPageHtml()));
 
   // ── Health & readiness ────────────────────────────────────────────────────
-  app.get("/health", (c) =>
-    c.json({
-      ok: true,
+  app.get("/health", async (c) => {
+    let dbOk = false;
+    try {
+      await db.run(sql`SELECT 1`);
+      dbOk = true;
+    } catch {
+      dbOk = false;
+    }
+    const whatsappOk = !config.WHATSAPP_ENABLED || transport.isReady();
+    return c.json({
+      ok: dbOk && whatsappOk,
       service: "whatsapp-ai-chatbot",
       whatsappEnabled: config.WHATSAPP_ENABLED,
       whatsappReady: transport.isReady(),
-    }),
-  );
+      database: dbOk ? "connected" : "disconnected",
+      timezone: config.DEFAULT_TIMEZONE,
+      uptime: process.uptime(),
+      nodeVersion: process.version,
+    });
+  });
 
   app.get("/ready", (c) => {
-    const ready = transport.isReady();
+    const ready = !config.WHATSAPP_ENABLED || transport.isReady();
+    const whatsappReady = transport.isReady();
     return c.json(
       {
         ok: ready,
         whatsappEnabled: config.WHATSAPP_ENABLED,
-        whatsappReady: ready,
+        whatsappReady,
       },
       ready ? 200 : 503,
     );
   });
 
+  // ── MegiBot-style AI chatbot widget ────────────────────────────────────────────────────────
   // ── MegiBot-style AI chatbot widget ────────────────────────────────────────────────────────
   app.get("/chat/test", (c) =>
     c.html(`<!doctype html>
@@ -85,135 +146,200 @@ export function createApp(transport: WhatsAppTransport) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Demo Clinic AI Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#06060e;--surface:rgba(255,255,255,.04);--surface2:rgba(255,255,255,.07);
+      --surface3:rgba(255,255,255,.1);--border:rgba(255,255,255,.08);
+      --indigo:#6366f1;--purple:#8b5cf6;--blue:#3b82f6;
+      --green:#22c55e;--yellow:#f59e0b;--red:#ef4444;
+      --text:#e2e8f0;--muted:#94a3b8;
+      --font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    }
     html{height:100%}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0d0b1e 0%,#1a0f35 40%,#0a0a18 100%);min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;gap:0}
-    /* ═══ WIDGET SHELL ═══ */
-    .widget{width:100%;max-width:400px;height:min(660px,90dvh);background:#1a1d2e;border-radius:20px;display:flex;flex-direction:column;box-shadow:0 30px 90px rgba(0,0,0,.65),0 0 0 1px rgba(99,102,241,.18);overflow:hidden}
-    /* HEADER */
-    .hdr{background:linear-gradient(175deg,#2e2a55 0%,#1e1b40 100%);padding:14px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.05)}
-    .hdr-avatar{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,#8b5cf6,#6366f1,#3b82f6);display:flex;align-items:center;justify-content:center;font-size:23px;flex-shrink:0;box-shadow:0 4px 14px rgba(99,102,241,.4)}
-    .hdr-info{flex:1;min-width:0}
-    .hdr-name{color:#fff;font-size:15px;font-weight:700;letter-spacing:.01em}
-    .hdr-status{display:flex;align-items:center;gap:5px;margin-top:2px}
-    .hdr-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e}
-    .hdr-txt{font-size:12px;color:#22c55e;font-weight:500}
-    .hdr-btns{display:flex;gap:6px}
-    .hdr-btn{width:30px;height:30px;border:none;border-radius:8px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.55);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px;text-decoration:none;transition:background .15s;line-height:1}
-    .hdr-btn:hover{background:rgba(255,255,255,.16);color:#fff}
-    /* MESSAGES */
-    #chat{flex:1;overflow-y:auto;padding:14px 14px 6px;display:flex;flex-direction:column;gap:2px;scrollbar-width:thin;scrollbar-color:rgba(99,102,241,.2) transparent}
-    #chat::-webkit-scrollbar{width:3px}#chat::-webkit-scrollbar-thumb{background:rgba(99,102,241,.25);border-radius:2px}
-    .row{display:flex;flex-direction:column;margin-bottom:2px}
+    body{font-family:var(--font);background:var(--bg);min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;gap:0;overflow:hidden}
+
+    body::before{content:'';position:fixed;inset:0;
+      background:radial-gradient(ellipse 800px 600px at 30% 20%,rgba(99,102,241,.1),transparent),
+                 radial-gradient(ellipse 600px 400px at 70% 80%,rgba(139,92,246,.08),transparent);
+      animation:bgShift 20s ease-in-out infinite alternate;pointer-events:none;z-index:0}
+    @keyframes bgShift{0%{transform:scale(1) rotate(0)}100%{transform:scale(1.1) rotate(3deg)}}
+
+    .orb{position:fixed;border-radius:50%;filter:blur(60px);opacity:.2;pointer-events:none;z-index:0}
+    .orb-1{width:300px;height:300px;background:var(--indigo);top:-80px;left:-80px;animation:orbFloat1 15s ease-in-out infinite}
+    .orb-2{width:250px;height:250px;background:var(--purple);bottom:-60px;right:-60px;animation:orbFloat2 18s ease-in-out infinite}
+    @keyframes orbFloat1{0%,100%{transform:translate(0,0)}50%{transform:translate(30px,40px)}}
+    @keyframes orbFloat2{0%,100%{transform:translate(0,0)}50%{transform:translate(-40px,-30px)}}
+
+    .widget{width:100%;max-width:420px;height:min(680px,92dvh);
+      background:rgba(18,18,36,.7);backdrop-filter:blur(30px) saturate(1.3);-webkit-backdrop-filter:blur(30px) saturate(1.3);
+      border-radius:24px;display:flex;flex-direction:column;
+      box-shadow:0 40px 100px rgba(0,0,0,.6),0 0 0 1px rgba(99,102,241,.12),inset 0 1px 0 rgba(255,255,255,.05);
+      overflow:hidden;position:relative;z-index:1;
+      animation:widgetIn .6s cubic-bezier(.34,1.56,.64,1) both}
+    @keyframes widgetIn{from{opacity:0;transform:translateY(30px) scale(.95)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+    .hdr{background:linear-gradient(160deg,rgba(46,42,85,.8),rgba(30,27,64,.9));
+      padding:16px 18px;display:flex;align-items:center;gap:14px;flex-shrink:0;
+      border-bottom:1px solid rgba(255,255,255,.06);position:relative;overflow:hidden}
+    .hdr::before{content:'';position:absolute;top:-50px;right:-50px;width:140px;height:140px;border-radius:50%;
+      background:radial-gradient(circle,rgba(99,102,241,.15),transparent 70%);pointer-events:none}
+    .hdr-avatar{width:48px;height:48px;border-radius:14px;
+      background:linear-gradient(135deg,#8b5cf6,#6366f1,#3b82f6);
+      display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;
+      box-shadow:0 6px 20px rgba(99,102,241,.4);position:relative;z-index:1;
+      animation:avatarPulse 3s ease-in-out infinite}
+    @keyframes avatarPulse{0%,100%{box-shadow:0 6px 20px rgba(99,102,241,.4)}50%{box-shadow:0 6px 30px rgba(99,102,241,.6)}}
+    .hdr-info{flex:1;min-width:0;position:relative;z-index:1}
+    .hdr-name{color:#fff;font-size:16px;font-weight:800;letter-spacing:-.01em}
+    .hdr-status{display:flex;align-items:center;gap:6px;margin-top:3px}
+    .hdr-dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+      box-shadow:0 0 8px var(--green);animation:dotPulse 2.5s ease-in-out infinite}
+    @keyframes dotPulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}60%{box-shadow:0 0 0 6px rgba(34,197,94,0)}}
+    .hdr-txt{font-size:12px;color:var(--green);font-weight:600}
+    .hdr-btns{display:flex;gap:6px;position:relative;z-index:1}
+    .hdr-btn{width:34px;height:34px;border:none;border-radius:10px;background:rgba(255,255,255,.06);
+      color:rgba(255,255,255,.5);cursor:pointer;display:flex;align-items:center;justify-content:center;
+      font-size:14px;text-decoration:none;transition:all .2s;line-height:1}
+    .hdr-btn:hover{background:rgba(255,255,255,.14);color:#fff;transform:scale(1.08)}
+
+    #chat{flex:1;overflow-y:auto;padding:16px 16px 8px;display:flex;flex-direction:column;gap:4px;
+      scrollbar-width:thin;scrollbar-color:rgba(99,102,241,.2) transparent}
+    #chat::-webkit-scrollbar{width:4px}
+    #chat::-webkit-scrollbar-thumb{background:rgba(99,102,241,.25);border-radius:2px}
+    .row{display:flex;flex-direction:column;margin-bottom:4px;animation:msgIn .35s cubic-bezier(.34,1.56,.64,1) both}
+    @keyframes msgIn{from{opacity:0;transform:translateY(12px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
     .row.user{align-items:flex-end}.row.bot{align-items:flex-start}
-    .bubble{max-width:80%;padding:11px 15px;font-size:14px;line-height:1.55;word-break:break-word}
-    .bubble.bot{background:#252a42;color:#dde1f0;border-radius:18px 18px 18px 5px}
-    .bubble.user{background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border-radius:18px 18px 5px 18px}
-    .bubble.sys{background:rgba(255,255,255,.04);color:rgba(255,255,255,.35);font-size:11px;border-radius:8px;text-align:center;max-width:100%;padding:5px 10px}
-    .msg-time{font-size:10px;color:rgba(255,255,255,.22);margin-top:3px;padding:0 3px}
-    /* BOOKING CARD */
-    .book-card{max-width:80%;background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.22);border-radius:14px;overflow:hidden}
-    .book-card-hd{background:rgba(34,197,94,.14);padding:7px 14px;font-size:11px;font-weight:700;color:#4ade80;letter-spacing:.05em}
-    .book-card-bd{padding:10px 14px;font-size:13.5px;color:#dde1f0;line-height:1.5}
-    .book-card-id{padding:0 14px 9px;font-size:10px;color:rgba(255,255,255,.2)}
-    /* TYPING */
-    .typing-row{display:flex;margin-bottom:2px}
-    .typing-bbl{background:#252a42;border-radius:18px 18px 18px 5px;padding:12px 16px;display:inline-flex;gap:5px;align-items:center}
-    .tdot{width:7px;height:7px;background:#6366f1;border-radius:50%;animation:tbounce 1.2s ease-in-out infinite both}
+    .bubble{max-width:82%;padding:12px 16px;font-size:14px;line-height:1.6;word-break:break-word}
+    .bubble.bot{background:rgba(37,42,66,.8);color:var(--text);border-radius:6px 20px 20px 20px;
+      border:1px solid rgba(255,255,255,.05)}
+    .bubble.user{background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border-radius:20px 6px 20px 20px;
+      box-shadow:0 4px 16px rgba(99,102,241,.3)}
+    .bubble.sys{background:rgba(255,255,255,.04);color:rgba(255,255,255,.35);font-size:11px;
+      border-radius:10px;text-align:center;max-width:100%;padding:6px 12px}
+    .msg-time{font-size:10px;color:rgba(255,255,255,.2);margin-top:4px;padding:0 4px}
+
+    .book-card{max-width:82%;border:1px solid rgba(34,197,94,.2);border-radius:16px;overflow:hidden;
+      background:rgba(34,197,94,.05);animation:msgIn .35s cubic-bezier(.34,1.56,.64,1) both}
+    .book-card-hd{background:rgba(34,197,94,.12);padding:8px 16px;font-size:11px;font-weight:800;
+      color:#4ade80;letter-spacing:.06em}
+    .book-card-bd{padding:12px 16px;font-size:13.5px;color:var(--text);line-height:1.5}
+    .book-card-id{padding:0 16px 10px;font-size:10px;color:rgba(255,255,255,.2)}
+
+    .typing-row{display:flex;margin-bottom:4px;animation:msgIn .3s ease both}
+    .typing-bbl{background:rgba(37,42,66,.8);border-radius:6px 20px 20px 20px;padding:14px 18px;
+      display:inline-flex;gap:6px;align-items:center;border:1px solid rgba(255,255,255,.05)}
+    .tdot{width:7px;height:7px;background:var(--indigo);border-radius:50%;animation:tbounce 1.2s ease-in-out infinite both}
     .tdot:nth-child(2){animation-delay:.2s}.tdot:nth-child(3){animation-delay:.4s}
     @keyframes tbounce{0%,60%,100%{transform:translateY(0);opacity:.3}30%{transform:translateY(-8px);opacity:1}}
-    /* HANDOFF BANNER */
-    .handoff-banner{border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.07);color:#fbbf24;border-radius:10px;padding:7px 13px;font-size:12px;text-align:center}
-    /* DAY SEPARATOR */
-    .day-sep{text-align:center;padding:8px 0}
-    .day-sep span{font-size:11px;color:rgba(255,255,255,.18);background:rgba(255,255,255,.04);padding:3px 10px;border-radius:8px}
-    /* SUGGESTIONS */
-    #suggestions{display:none;flex-wrap:wrap;gap:7px;padding:10px 14px;flex-shrink:0}
-    .chip{border:1px solid rgba(99,102,241,.32);background:rgba(99,102,241,.06);color:#a5b4fc;border-radius:20px;padding:6px 15px;font-size:12.5px;cursor:pointer;font-family:inherit;transition:all .15s;line-height:1.3}
-    .chip:hover{background:rgba(99,102,241,.2);border-color:#6366f1;color:#fff}
-    /* INPUT */
-    .ibar{padding:10px 14px 14px;flex-shrink:0}
-    .input-wrap{display:flex;align-items:center;background:#252a42;border-radius:26px;border:1.5px solid rgba(99,102,241,.15);padding:5px 5px 5px 16px;gap:8px;transition:border-color .2s}
-    .input-wrap:focus-within{border-color:rgba(99,102,241,.55);box-shadow:0 0 0 3px rgba(99,102,241,.08)}
-    #msg{flex:1;background:transparent;border:none;color:#dde1f0;font:inherit;font-size:14px;outline:none;resize:none;max-height:100px;line-height:1.5;padding:5px 0}
-    #msg::placeholder{color:rgba(255,255,255,.25)}
-    .send-btn{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 12px rgba(99,102,241,.45);transition:transform .15s,opacity .15s}
-    .send-btn:hover{transform:scale(1.07)}
-    .send-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
-    .send-btn svg{width:16px;height:16px;fill:#fff}
-    /* SETTINGS STRIP */
-    .sbar{display:flex;gap:8px;align-items:center;justify-content:center;padding:10px 0 6px;flex-wrap:wrap}
-    .sbar label{font-size:11px;color:rgba(255,255,255,.25)}
-    .sbar input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:4px 10px;color:rgba(255,255,255,.55);font:inherit;font-size:12px;width:130px;outline:none}
-    .sbar input:focus{border-color:rgba(99,102,241,.5)}
-    .sbtn{background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.22);color:#a5b4fc;border-radius:8px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer;transition:background .15s}
-    .sbtn:hover{background:rgba(99,102,241,.22)}
-    .bnav{display:flex;gap:16px;justify-content:center;padding:4px 0 12px}
-    .bnav a{color:rgba(255,255,255,.18);font-size:11px;text-decoration:none;transition:color .15s}
+
+    .handoff-banner{border:1px solid rgba(251,191,36,.25);background:rgba(251,191,36,.06);color:#fbbf24;
+      border-radius:12px;padding:8px 14px;font-size:12px;text-align:center;animation:msgIn .3s ease both}
+
+    .day-sep{text-align:center;padding:10px 0}
+    .day-sep span{font-size:11px;color:rgba(255,255,255,.18);background:rgba(255,255,255,.04);padding:4px 14px;border-radius:20px}
+
+    #suggestions{display:none;flex-wrap:wrap;gap:8px;padding:12px 16px;flex-shrink:0}
+    .chip{border:1px solid rgba(99,102,241,.25);background:rgba(99,102,241,.06);color:#a5b4fc;
+      border-radius:22px;padding:7px 16px;font-size:12.5px;cursor:pointer;font-family:inherit;
+      transition:all .2s;line-height:1.3}
+    .chip:hover{background:rgba(99,102,241,.18);border-color:var(--indigo);color:#fff;transform:translateY(-1px)}
+
+    .ibar{padding:12px 16px 16px;flex-shrink:0}
+    .input-wrap{display:flex;align-items:center;background:rgba(37,42,66,.6);border-radius:28px;
+      border:1.5px solid rgba(99,102,241,.12);padding:6px 6px 6px 18px;gap:8px;
+      transition:border-color .25s,box-shadow .25s}
+    .input-wrap:focus-within{border-color:rgba(99,102,241,.45);box-shadow:0 0 0 4px rgba(99,102,241,.08)}
+    #msg{flex:1;background:transparent;border:none;color:var(--text);font:inherit;font-size:14px;
+      outline:none;resize:none;max-height:100px;line-height:1.5;padding:6px 0}
+    #msg::placeholder{color:rgba(255,255,255,.22)}
+    .send-btn{width:42px;height:42px;border-radius:50%;
+      background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;cursor:pointer;
+      display:flex;align-items:center;justify-content:center;flex-shrink:0;
+      box-shadow:0 4px 16px rgba(99,102,241,.4);transition:all .2s cubic-bezier(.34,1.56,.64,1)}
+    .send-btn:hover:not(:disabled){transform:scale(1.1);box-shadow:0 6px 24px rgba(99,102,241,.55)}
+    .send-btn:active:not(:disabled){transform:scale(.95)}
+    .send-btn:disabled{opacity:.35;cursor:not-allowed;transform:none}
+    .send-btn svg{width:18px;height:18px;fill:#fff}
+
+    .sbar{display:flex;gap:10px;align-items:center;justify-content:center;padding:12px 0 8px;flex-wrap:wrap;position:relative;z-index:1}
+    .sbar label{font-size:12px;color:rgba(255,255,255,.25);font-weight:600}
+    .sbar input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px;
+      padding:6px 12px;color:rgba(255,255,255,.55);font:inherit;font-size:12px;width:140px;outline:none;transition:border-color .2s}
+    .sbar input:focus{border-color:rgba(99,102,241,.4)}
+    .sbtn{background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.2);color:#a5b4fc;border-radius:10px;
+      padding:6px 12px;font:inherit;font-size:12px;cursor:pointer;transition:all .2s}
+    .sbtn:hover{background:rgba(99,102,241,.2);color:#fff}
+    .bnav{display:flex;gap:20px;justify-content:center;padding:6px 0 14px;position:relative;z-index:1}
+    .bnav a{color:rgba(255,255,255,.18);font-size:12px;text-decoration:none;font-weight:600;transition:color .2s}
     .bnav a:hover{color:rgba(255,255,255,.5)}
-    @media(max-width:440px){body{padding:0;justify-content:flex-start;background:#0d0b1e}.widget{max-width:100%;border-radius:0;height:100dvh}.sbar,.bnav{display:none}}
+
+    @media(max-width:460px){
+      body{padding:0;justify-content:flex-start;background:var(--bg)}
+      .widget{max-width:100%;border-radius:0;height:100dvh}
+      .sbar,.bnav{display:none}
+    }
   </style>
 </head>
 <body>
-<div class="widget">
-  <div class="hdr">
-    <div class="hdr-avatar">🏥</div>
-    <div class="hdr-info">
-      <div class="hdr-name">Demo Clinic AI</div>
-      <div class="hdr-status"><span class="hdr-dot" id="sDot"></span><span class="hdr-txt" id="statusTxt">Connecting...</span></div>
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+
+  <div class="widget">
+    <div class="hdr">
+      <div class="hdr-avatar">🏥</div>
+      <div class="hdr-info">
+        <div class="hdr-name">Demo Clinic AI</div>
+        <div class="hdr-status"><span class="hdr-dot" id="sDot"></span><span class="hdr-txt" id="statusTxt">Connecting...</span></div>
+      </div>
+      <div class="hdr-btns">
+        <button class="hdr-btn" onclick="newUser()" title="New conversation">🔄</button>
+        <button class="hdr-btn" onclick="clearChat()" title="Clear">&#128465;</button>
+        <a class="hdr-btn" href="/admin" title="Admin">⚙</a>
+      </div>
     </div>
-    <div class="hdr-btns">
-      <button class="hdr-btn" onclick="newUser()" title="New conversation">🔄</button>
-      <button class="hdr-btn" onclick="clearChat()" title="Clear">&#128465;</button>
-      <a class="hdr-btn" href="/admin" title="Admin">⚙</a>
+    <div id="chat"></div>
+    <div id="suggestions"></div>
+    <div class="ibar">
+      <div class="input-wrap">
+        <textarea id="msg" rows="1" placeholder="Ask me anything..." onkeydown="handleKey(event)" oninput="grow(this)"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="send()" title="Send">
+          <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
+        </button>
+      </div>
     </div>
   </div>
-  <div id="chat"></div>
-  <div id="suggestions"></div>
-  <div class="ibar">
-    <div class="input-wrap">
-      <textarea id="msg" rows="1" placeholder="Ask me anything..." onkeydown="handleKey(event)" oninput="grow(this)"></textarea>
-      <button class="send-btn" id="sendBtn" onclick="send()" title="Send">
-        <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
-      </button>
-    </div>
+  <div class="sbar">
+    <label>Phone</label><input id="fromIn" value="923001234573" />
+    <label>Name</label><input id="nameIn" value="Test User" style="width:100px" />
+    <button class="sbtn" onclick="newUser()">+ New User</button>
+    <button class="sbtn" onclick="clearChat()">Clear</button>
   </div>
-</div>
-<div class="sbar">
-  <label>Phone</label><input id="fromIn" value="923001234573" />
-  <label>Name</label><input id="nameIn" value="Test User" style="width:100px" />
-  <button class="sbtn" onclick="newUser()">+ New User</button>
-  <button class="sbtn" onclick="clearChat()">Clear</button>
-</div>
-<div class="bnav">
-  <a href="/">🏠 Home</a>
-  <a href="/admin">⚙️ Admin</a>
-  <a href="/health">❤️ Status</a>
-</div>
+  <div class="bnav">
+    <a href="/">🏠 Home</a>
+    <a href="/admin">⚙️ Admin</a>
+    <a href="/health">❤️ Status</a>
+  </div>
 <script>
 (function(){
-  /* ── STATE ──────────────────────────────────────────────────────── */
-  var from = document.getElementById('fromIn').value;
-  var name = document.getElementById('nameIn').value;
-  var isSending = false;       // guards against concurrent sends
-  var abortCtrl = null;        // AbortController for current in-flight fetch
-  var STORAGE_KEY = 'chatHistory_v3';
-  var lastSendTime = 0;
-  var MIN_SEND_GAP = 600;      // ms minimum between requests (avoids Groq rate-limit spikes)
+  var from=document.getElementById('fromIn').value;
+  var name=document.getElementById('nameIn').value;
+  var isSending=false;
+  var abortCtrl=null;
+  var STORAGE_KEY='chatHistory_v3';
+  var lastSendTime=0;
+  var MIN_SEND_GAP=600;
 
-  /* ── HELPERS ────────────────────────────────────────────── */
   function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
-  function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
-  // grow and handleKey MUST be on window — they are called from inline
-  // oninput/onkeydown attributes which only resolve to global scope.
+  function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');}
   window.grow=function(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,130)+'px';};
   function grow(el){window.grow(el);}
   window.handleKey=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(window.send)window.send();}};
   function handleKey(e){window.handleKey(e);}
   function scrollDown(){var c=document.getElementById('chat');if(c)c.scrollTop=c.scrollHeight;}
 
-  /* ── HEALTH POLL ─────────────────────────────────────────── */
   function pollHealth(){
     fetch('/health').then(function(r){return r.json();}).then(function(d){
       var txt=document.getElementById('statusTxt');
@@ -228,16 +354,15 @@ export function createApp(transport: WhatsAppTransport) {
   pollHealth();
   setInterval(pollHealth,30000);
 
-  /* ── SUGGESTIONS ────────────────────────────────────────── */
   var SUGGESTIONS=[
-    '👋 Hi there!',
-    '🗓 Book an appointment',
-    '📝 My appointments',
-    '💰 Consultation fees',
-    '🧑\u200d⚕️ Services offered',
-    '📍 Clinic location',
-    '⏰ Opening hours',
-    '❌ Cancel appointment',
+    '\\ud83d\\udc4b Hi there!',
+    '\\ud83d\\uddd3 Book an appointment',
+    '\\ud83d\\udcdd My appointments',
+    '\\ud83d\\udcb0 Consultation fees',
+    '\\ud83e\\uddd1\\u200d\\u2695\\ufe0f Services offered',
+    '\\ud83d\\udccd Clinic location',
+    '\\u23f0 Opening hours',
+    '\\u274c Cancel appointment',
   ];
   function showSuggestions(){
     var el=document.getElementById('suggestions');
@@ -256,42 +381,36 @@ export function createApp(transport: WhatsAppTransport) {
     send();
   };
 
-  /* ── PERSISTENCE (localStorage) ──────────────────────────── */
   var msgStore=[];
   function saveToStorage(){
     try{localStorage.setItem(STORAGE_KEY+'_'+from,JSON.stringify(msgStore.slice(-80)));}catch(e){}
   }
   function loadFromStorage(){
-    try{
-      var saved=localStorage.getItem(STORAGE_KEY+'_'+from);
-      if(saved)msgStore=JSON.parse(saved);
-    }catch(e){msgStore=[];}
+    try{var saved=localStorage.getItem(STORAGE_KEY+'_'+from);if(saved)msgStore=JSON.parse(saved);}catch(e){msgStore=[];}
   }
   function restoreMessages(){
     loadFromStorage();
     var chat=document.getElementById('chat');
     chat.innerHTML='<div class="day-sep"><span>Today</span></div>';
     if(msgStore.length===0){
-      // MegiBot-style welcome
-      renderBubble('bot','Good day! \ud83d\udc4b I\u2019m Demo Clinic AI, your intelligent health assistant.\n\nI can help you with:\n\u2022 Appointments & Bookings\n\u2022 Services & Fees\n\u2022 Doctor Information\n\u2022 Clinic Hours & Location\n\nWhat can I help you with today? \ud83d\ude0a','',now(),false);
+      renderBubble('bot','Good day! \\ud83d\\udc4b I\\u2019m Demo Clinic AI, your intelligent health assistant.\\n\\nI can help you with:\\n\\u2022 Appointments & Bookings\\n\\u2022 Services & Fees\\n\\u2022 Doctor Information\\n\\u2022 Clinic Hours & Location\\n\\nWhat can I help you with today? \\ud83d\\ude0a','',now(),false);
       showSuggestions();
-    } else {
+    }else{
       msgStore.forEach(function(m){renderBubble(m.role,m.text,m.extra,m.time,false);});
       hideSuggestions();
     }
     scrollDown();
   }
 
-  /* ── BUBBLE RENDERING ──────────────────────────────────────── */
   function renderBubble(role,text,extra,time,save){
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
     row.className='row '+(role==='user'?'user':'bot');
     if(role==='sys'){
       row.innerHTML='<div class="bubble sys">'+esc(text)+'</div>';
-    } else if(role==='card'){
-      row.innerHTML=text; // pre-built HTML card
-    } else {
+    }else if(role==='card'){
+      row.innerHTML=text;
+    }else{
       row.innerHTML='<div class="bubble '+role+'">'+esc(text)+'</div>'
         +'<div class="msg-time">'+(time||now())+'</div>';
     }
@@ -307,7 +426,6 @@ export function createApp(transport: WhatsAppTransport) {
     renderBubble(role,text,extra,now(),true);
   }
 
-  /* booking confirmation card */
   function addBookingCard(text,meta){
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
@@ -324,9 +442,8 @@ export function createApp(transport: WhatsAppTransport) {
     scrollDown();
   }
 
-  /* ── TYPING INDICATOR (idempotent) ───────────────────────────── */
   function showTyping(){
-    if(document.getElementById('typing-row'))return; // idempotent
+    if(document.getElementById('typing-row'))return;
     var chat=document.getElementById('chat');
     var row=document.createElement('div');
     row.className='typing-row';row.id='typing-row';
@@ -335,9 +452,7 @@ export function createApp(transport: WhatsAppTransport) {
   }
   function removeTyping(){var t=document.getElementById('typing-row');if(t)t.remove();}
 
-  /* ── ACTIONS ────────────────────────────────────────────────── */
   window.newUser=function(){
-    // Cancel any in-flight request first
     if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
     isSending=false;
     removeTyping();
@@ -366,29 +481,23 @@ export function createApp(transport: WhatsAppTransport) {
   function clearChatUI(){
     var chat=document.getElementById('chat');
     chat.innerHTML='<div class="day-sep"><span>Today</span></div>';
-    renderBubble('bot','Chat cleared. How can I help you today? \ud83d\ude0a','',now(),false);
+    renderBubble('bot','Chat cleared. How can I help you today? \\ud83d\\ude0a','',now(),false);
     showSuggestions();
   }
 
-  /* ── SEND (all race conditions fixed) ───────────────────────── */
   window.send=async function(){
-    // BUG FIX #1: guard at top — no concurrent sends
     if(isSending)return;
     var text=document.getElementById('msg').value.trim();
     if(!text)return;
-
-    // Rate-limit protection: enforce minimum gap between requests
     var now_ms=Date.now();
     var gap=now_ms-lastSendTime;
     if(gap<MIN_SEND_GAP){
       await new Promise(function(res){setTimeout(res,MIN_SEND_GAP-gap);});
     }
-
     from=document.getElementById('fromIn').value||'923001234573';
     name=document.getElementById('nameIn').value||'User';
     isSending=true;
     lastSendTime=Date.now();
-
     var btn=document.getElementById('sendBtn');
     btn.disabled=true;
     hideSuggestions();
@@ -396,11 +505,8 @@ export function createApp(transport: WhatsAppTransport) {
     document.getElementById('msg').value='';
     document.getElementById('msg').style.height='auto';
     showTyping();
-
-    // BUG FIX #3: AbortController so clearChat() cancels the fetch
     abortCtrl=new AbortController();
     var signal=abortCtrl.signal;
-
     try{
       var r=await fetch('/chat/test',{
         method:'POST',
@@ -410,23 +516,17 @@ export function createApp(transport: WhatsAppTransport) {
       });
       abortCtrl=null;
       removeTyping();
-
       if(r.status===429){
         addBubble('sys','⚠️ Too many messages. Please wait 5 seconds and try again.');
-        // Re-enable after cooldown
         setTimeout(function(){isSending=false;btn.disabled=false;document.getElementById('msg').focus();},5000);
         return;
       }
-
       var d=await r.json();
-
-      // Booking confirmation card
       if(d.metadata&&d.metadata.booked&&d.text){
         addBookingCard(d.text,d.metadata);
-      } else if(d.text){
+      }else if(d.text){
         addBubble('bot',d.text);
       }
-
       if(d.handoff){
         var chat=document.getElementById('chat');
         var b=document.createElement('div');
@@ -434,26 +534,21 @@ export function createApp(transport: WhatsAppTransport) {
         b.textContent='🔁 Transferred to a human agent';
         chat.appendChild(b);scrollDown();
       }
-
       if(d.error&&!d.text)addBubble('sys','Error: '+d.error);
-
     }catch(e){
       removeTyping();
       if(e.name!=='AbortError'){
         addBubble('sys','⚠️ Could not reach the server. Please check your connection and retry.');
       }
     }
-
     isSending=false;
     btn.disabled=false;
     document.getElementById('msg').focus();
   };
 
-  /* ── INIT ───────────────────────────────────────────────────── */
   restoreMessages();
   document.getElementById('msg').focus();
 
-  // Expose for settings bar events
   document.getElementById('fromIn').addEventListener('change',function(){
     from=this.value;
     restoreMessages();
@@ -486,7 +581,7 @@ export function createApp(transport: WhatsAppTransport) {
 
   // ── Admin API — existing routes ───────────────────────────────────────────
   app.post("/admin/knowledge", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const body = knowledgeSchema.parse(await c.req.json());
     const chunks = await upsertKnowledge({
       businessId: body.businessId ?? config.DEFAULT_BUSINESS_ID,
@@ -498,7 +593,7 @@ export function createApp(transport: WhatsAppTransport) {
   });
 
   app.get("/admin/appointments", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
     // Join with customers so the UI can show name + phone instead of raw IDs
     const rows = await db
@@ -528,7 +623,7 @@ export function createApp(transport: WhatsAppTransport) {
   });
 
   app.post("/admin/send", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const body = sendSchema.parse(await c.req.json());
     await transport.sendText(body.to, body.text);
     return c.json({ ok: true });
@@ -536,7 +631,7 @@ export function createApp(transport: WhatsAppTransport) {
 
   /** GET /admin/knowledge-list — list all knowledge entries */
   app.get("/admin/knowledge-list", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
     const entries = await listKnowledge(businessId);
     return c.json({ ok: true, entries });
@@ -544,7 +639,7 @@ export function createApp(transport: WhatsAppTransport) {
 
   /** DELETE /admin/knowledge — delete all chunks for a title slug */
   app.delete("/admin/knowledge", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const body = deleteKnowledgeSchema.parse(await c.req.json());
     await deleteKnowledgeByTitle(
       body.businessId ?? config.DEFAULT_BUSINESS_ID,
@@ -555,7 +650,7 @@ export function createApp(transport: WhatsAppTransport) {
 
   /** POST /admin/broadcast — send a message to all customers */
   app.post("/admin/broadcast", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const body = broadcastSchema.parse(await c.req.json());
     const businessId = body.businessId ?? config.DEFAULT_BUSINESS_ID;
     const allCustomers = await db
@@ -582,7 +677,7 @@ export function createApp(transport: WhatsAppTransport) {
 
   /** GET /admin/business — current business settings */
   app.get("/admin/business", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
     const business = await db.query.businesses.findFirst({
       where: eq(businesses.id, businessId),
@@ -592,7 +687,7 @@ export function createApp(transport: WhatsAppTransport) {
 
   /** GET /admin/analytics — aggregated event stats */
   app.get("/admin/analytics", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
 
     const now = new Date();
@@ -650,8 +745,11 @@ export function createApp(transport: WhatsAppTransport) {
 
   /** GET /admin/customers — paginated customer list with appointment counts */
   app.get("/admin/customers", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const businessId = c.req.query("businessId") ?? config.DEFAULT_BUSINESS_ID;
+    const page = Math.max(1, parseInt(c.req.query("page") ?? "1", 10));
+    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query("limit") ?? "50", 10)));
+    const offset = (page - 1) * pageSize;
 
     // Use LEFT JOIN + COUNT instead of correlated subquery for SQLite compatibility
     const rows = await db
@@ -674,16 +772,39 @@ export function createApp(transport: WhatsAppTransport) {
         customers.createdAt,
       )
       .orderBy(sql`${customers.createdAt} desc`)
-      .limit(200);
+      .limit(pageSize)
+      .offset(offset);
 
-    return c.json({ ok: true, customers: rows });
+    const [countRow] = await db
+      .select({ total: sql<number>`cast(count(*) as integer)` })
+      .from(customers)
+      .where(eq(customers.businessId, businessId));
+
+    return c.json({
+      ok: true,
+      customers: rows,
+      pagination: {
+        page,
+        limit: pageSize,
+        total: countRow?.total ?? 0,
+        pages: Math.ceil((countRow?.total ?? 0) / pageSize),
+      },
+    });
   });
 
   /** POST /admin/update-business — patch business settings */
   app.post("/admin/update-business", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const body = updateBusinessSchema.parse(await c.req.json());
     const businessId = config.DEFAULT_BUSINESS_ID;
+
+    // Verify business exists before updating
+    const existing = await db.query.businesses.findFirst({
+      where: eq(businesses.id, businessId),
+    });
+    if (!existing) {
+      return c.json({ ok: false, error: "business not found" }, 404);
+    }
 
     const patch: Partial<typeof businesses.$inferInsert> = {
       updatedAt: new Date().toISOString(),
@@ -697,20 +818,25 @@ export function createApp(transport: WhatsAppTransport) {
       patch.appointmentDurationMinutes = body.appointmentDurationMinutes;
 
     await db.update(businesses).set(patch).where(eq(businesses.id, businessId));
+    clearBusinessCache();
 
     return c.json({ ok: true });
   });
 
   /** POST /admin/update-appointment — cancel or update an appointment */
   app.post("/admin/update-appointment", async (c) => {
-    assertAdmin(c.req.header("x-admin-key"));
+    assertAdmin(c, c.req.header("x-admin-key"), adminRateGuard);
     const body = updateAppointmentSchema.parse(await c.req.json());
+    const businessId = body.businessId ?? config.DEFAULT_BUSINESS_ID;
 
-    await db
+    const result = await db
       .update(appointments)
       .set({ status: body.status, updatedAt: new Date().toISOString() })
-      .where(eq(appointments.id, body.id));
+      .where(and(eq(appointments.id, body.id), eq(appointments.businessId, businessId)));
 
+    if (typeof result.rowsAffected === "number" && result.rowsAffected === 0) {
+      return c.json({ ok: false, error: "appointment not found" }, 404);
+    }
     return c.json({ ok: true });
   });
 
@@ -753,6 +879,7 @@ const updateBusinessSchema = z.object({
 });
 
 const updateAppointmentSchema = z.object({
+  businessId: z.string().optional(),
   id: z.string().min(1),
   status: z.enum(["scheduled", "cancelled", "completed", "no_show"]),
 });
@@ -769,15 +896,34 @@ const broadcastSchema = z.object({
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
-function assertAdmin(key: string | undefined) {
+function assertAdmin(c: { req: { header: (name: string) => string | undefined } }, key: string | undefined, guard: WindowGuard) {
+  // Rate limit admin endpoints by source IP
+  const ip = c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? "unknown";
+  if (!guard.allow(ip)) {
+    throw new HTTPException(429, { message: "admin rate limit exceeded" });
+  }
   if (!config.ADMIN_API_KEY) {
     throw new HTTPException(503, {
       message: "admin endpoints disabled — set the ADMIN_API_KEY secret",
     });
   }
   if (key !== config.ADMIN_API_KEY) {
-    throw new HTTPException(401, { message: "admin key required" });
+    throw new HTTPException(401, { message: "invalid admin key" });
   }
+}
+
+function isAllowedOrigin(origin: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+
+  if (url.origin === "https://clinicchatbot.fly.dev") return true;
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") return true;
+  return false;
 }
 
 // ── HTML pages ────────────────────────────────────────────────────────────────
@@ -788,734 +934,444 @@ function landingPageHtml(): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Clinic Chatbot</title>
+  <title>Clinic Chatbot — AI-Powered WhatsApp Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    :root {
-      --bg: #0d1117; --surface: #161b22; --surface2: #1c2128;
-      --border: #30363d; --green: #25d366; --green-dark: #1aab53;
-      --text: #e6edf3; --muted: #8b949e; --red: #f85149;
-      --blue: #58a6ff; --yellow: #d29922;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#06060e;--bg2:#0c0c1d;--surface:rgba(255,255,255,.03);
+      --surface2:rgba(255,255,255,.06);--border:rgba(255,255,255,.08);
+      --border-h:rgba(255,255,255,.15);
+      --green:#22c55e;--green-g:rgba(34,197,94,.15);
+      --indigo:#6366f1;--indigo-g:rgba(99,102,241,.15);
+      --cyan:#06b6d4;--purple:#a855f7;--pink:#ec4899;
+      --text:#f1f5f9;--text2:#94a3b8;--text3:#475569;
+      --font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+      --mono:'JetBrains Mono',monospace;
     }
-    body { background: var(--bg); color: var(--text); min-height: 100vh; }
+    html{scroll-behavior:smooth}
+    body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
 
-    /* NAV */
-    nav {
-      position: sticky; top: 0; z-index: 100;
-      background: rgba(13,17,23,.92); backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 0 24px; height: 60px;
+    /* ═══ ANIMATED GRADIENT MESH BACKGROUND ═══ */
+    .mesh-bg{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+    .mesh-bg::before{content:'';position:absolute;width:150vmax;height:150vmax;top:-50vmax;left:-50vmax;
+      background:
+        radial-gradient(ellipse 600px 600px at 20% 30%,rgba(99,102,241,.12),transparent),
+        radial-gradient(ellipse 500px 500px at 75% 20%,rgba(168,85,247,.1),transparent),
+        radial-gradient(ellipse 700px 400px at 60% 70%,rgba(34,197,94,.08),transparent),
+        radial-gradient(ellipse 400px 400px at 30% 80%,rgba(6,182,212,.08),transparent);
+      animation:meshDrift 25s ease-in-out infinite alternate}
+    @keyframes meshDrift{
+      0%{transform:translate(0,0) rotate(0deg) scale(1)}
+      33%{transform:translate(3%,-4%) rotate(3deg) scale(1.02)}
+      66%{transform:translate(-2%,3%) rotate(-2deg) scale(.98)}
+      100%{transform:translate(4%,2%) rotate(4deg) scale(1.03)}}
+
+    /* ═══ FLOATING BLOBS ═══ */
+    .blob{position:fixed;border-radius:50%;filter:blur(80px);opacity:.35;pointer-events:none;z-index:0}
+    .blob-1{width:400px;height:400px;background:var(--indigo);top:-100px;right:-100px;animation:blobFloat1 20s ease-in-out infinite}
+    .blob-2{width:350px;height:350px;background:var(--purple);bottom:-80px;left:-80px;animation:blobFloat2 22s ease-in-out infinite}
+    .blob-3{width:300px;height:300px;background:var(--cyan);top:50%;left:50%;transform:translate(-50%,-50%);animation:blobFloat3 18s ease-in-out infinite}
+    @keyframes blobFloat1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-40px,60px) scale(1.15)}}
+    @keyframes blobFloat2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(50px,-40px) scale(1.1)}}
+    @keyframes blobFloat3{0%,100%{transform:translate(-50%,-50%) scale(1)}50%{transform:translate(-50%,-50%) scale(1.2)}}
+
+    /* ═══ PARTICLES ═══ */
+    .particles{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+    .particle{position:absolute;width:2px;height:2px;background:rgba(255,255,255,.3);border-radius:50%;animation:particleFloat linear infinite}
+    @keyframes particleFloat{0%{transform:translateY(100vh) scale(0);opacity:0}10%{opacity:1}90%{opacity:1}100%{transform:translateY(-10vh) scale(1);opacity:0}}
+
+    /* ═══ GLASSMORPHISM ═══ */
+    .glass{background:rgba(255,255,255,.03);backdrop-filter:blur(20px) saturate(1.2);-webkit-backdrop-filter:blur(20px) saturate(1.2);border:1px solid var(--border)}
+    .glass-strong{background:rgba(255,255,255,.05);backdrop-filter:blur(30px) saturate(1.4);-webkit-backdrop-filter:blur(30px) saturate(1.4);border:1px solid rgba(255,255,255,.1)}
+
+    /* ═══ NAV ═══ */
+    nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:0 24px;height:64px;display:flex;align-items:center;justify-content:space-between;transition:all .4s}
+    nav.scrolled{background:rgba(6,6,14,.85);backdrop-filter:blur(20px);border-bottom:1px solid var(--border)}
+    .brand{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:800;color:var(--text);text-decoration:none}
+    .brand-icon{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,var(--green),var(--cyan));display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 4px 20px rgba(34,197,94,.3)}
+    .nav-links{display:flex;gap:8px;align-items:center}
+    .nav-link{padding:8px 16px;border-radius:10px;font-size:14px;font-weight:600;color:var(--text2);text-decoration:none;transition:all .25s;position:relative}
+    .nav-link:hover{color:var(--text);background:var(--surface2)}
+    .nav-link.primary{background:linear-gradient(135deg,var(--green),#16a34a);color:#000;box-shadow:0 4px 16px rgba(34,197,94,.25)}
+    .nav-link.primary:hover{transform:translateY(-1px);box-shadow:0 6px 24px rgba(34,197,94,.35)}
+
+    /* ═══ MAIN CONTENT ═══ */
+    .content{position:relative;z-index:1}
+
+    /* ═══ HERO ═══ */
+    .hero{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:120px 24px 80px;position:relative}
+    .hero-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 16px 6px 8px;border-radius:99px;font-size:13px;font-weight:600;color:var(--green);margin-bottom:32px;animation:fadeSlideUp .8s ease both}
+    .hero-badge-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulseDot 2s ease-in-out infinite}
+    @keyframes pulseDot{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}50%{box-shadow:0 0 0 8px rgba(34,197,94,0)}}
+    .hero h1{font-size:clamp(40px,7vw,80px);font-weight:900;line-height:1.05;letter-spacing:-.03em;margin-bottom:24px;animation:fadeSlideUp .8s ease .1s both}
+    .hero h1 .gradient-text{background:linear-gradient(135deg,var(--green),var(--cyan),var(--indigo));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    .hero p{font-size:clamp(16px,2vw,20px);color:var(--text2);max-width:600px;line-height:1.7;margin:0 auto 40px;animation:fadeSlideUp .8s ease .2s both}
+    .hero-actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;animation:fadeSlideUp .8s ease .3s both}
+    .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;text-decoration:none;border:none;transition:all .3s cubic-bezier(.34,1.56,.64,1);position:relative;overflow:hidden}
+    .btn::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,.1),transparent);opacity:0;transition:opacity .3s}
+    .btn:hover::before{opacity:1}
+    .btn-primary{background:linear-gradient(135deg,var(--green),#16a34a);color:#000;box-shadow:0 8px 32px rgba(34,197,94,.3)}
+    .btn-primary:hover{transform:translateY(-2px) scale(1.02);box-shadow:0 12px 40px rgba(34,197,94,.4)}
+    .btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
+    .btn-secondary:hover{transform:translateY(-2px);border-color:var(--border-h);background:rgba(255,255,255,.08)}
+
+    /* ═══ STATUS BAR ═══ */
+    .status-bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:20px;padding:16px 28px;border-radius:16px;margin-top:48px;animation:fadeSlideUp .8s ease .4s both}
+    .status-item{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:500}
+    .status-label{color:var(--text2)}
+    .status-value{color:var(--text);font-weight:700}
+    .status-divider{width:1px;height:20px;background:var(--border)}
+    .badge{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:99px;font-size:12px;font-weight:700}
+    .badge-green{background:var(--green-g);color:var(--green)}
+    .badge-red{background:rgba(248,81,73,.15);color:#f85149}
+    .badge-yellow{background:rgba(210,153,34,.15);color:#d29922}
+    .badge-blue{background:rgba(88,166,255,.15);color:#58a6ff}
+    .badge-dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+    /* ═══ SCROLL INDICATOR ═══ */
+    .scroll-indicator{position:absolute;bottom:32px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:8px;animation:fadeSlideUp .8s ease .5s both}
+    .scroll-indicator span{font-size:12px;color:var(--text3);font-weight:500;letter-spacing:.1em;text-transform:uppercase}
+    .scroll-mouse{width:24px;height:38px;border:2px solid var(--border);border-radius:12px;position:relative}
+    .scroll-mouse::before{content:'';position:absolute;top:6px;left:50%;transform:translateX(-50%);width:3px;height:8px;background:var(--text2);border-radius:2px;animation:scrollWheel 2s ease-in-out infinite}
+    @keyframes scrollWheel{0%,100%{transform:translateX(-50%) translateY(0);opacity:1}50%{transform:translateX(-50%) translateY(10px);opacity:.3}}
+
+    /* ═══ SECTION ═══ */
+    .section{padding:80px 24px;max-width:1200px;margin:0 auto}
+    .section-header{text-align:center;margin-bottom:56px}
+    .section-label{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.15em;color:var(--indigo);margin-bottom:12px}
+    .section-title{font-size:clamp(28px,4vw,44px);font-weight:900;letter-spacing:-.02em;line-height:1.15}
+    .section-desc{font-size:16px;color:var(--text2);max-width:500px;margin:16px auto 0;line-height:1.6}
+
+    /* ═══ BENTO GRID ═══ */
+    .bento{display:grid;grid-template-columns:repeat(4,1fr);grid-auto-rows:minmax(180px,auto);gap:16px}
+    @media(max-width:900px){.bento{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:500px){.bento{grid-template-columns:1fr}}
+    .bento-card{border-radius:20px;padding:28px;position:relative;overflow:hidden;transition:all .4s cubic-bezier(.34,1.56,.64,1);cursor:default;transform-style:preserve-3d;perspective:1000px}
+    .bento-card:hover{transform:translateY(-4px);border-color:var(--border-h);box-shadow:0 20px 60px rgba(0,0,0,.3)}
+    .bento-card::after{content:'';position:absolute;inset:0;background:radial-gradient(600px circle at var(--mx,50%) var(--my,50%),rgba(255,255,255,.04),transparent 40%);opacity:0;transition:opacity .3s;pointer-events:none}
+    .bento-card:hover::after{opacity:1}
+    .bento-wide{grid-column:span 2}
+    .bento-tall{grid-row:span 2}
+    .bento-icon{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:16px;position:relative}
+    .bento-card h3{font-size:18px;font-weight:800;margin-bottom:8px}
+    .bento-card p{font-size:14px;color:var(--text2);line-height:1.6}
+
+    /* ═══ STAT COUNTERS ═══ */
+    .counter-value{font-size:42px;font-weight:900;line-height:1;margin-bottom:4px;font-variant-numeric:tabular-nums}
+    .counter-label{font-size:13px;color:var(--text2);font-weight:600;text-transform:uppercase;letter-spacing:.08em}
+
+    /* ═══ APPOINTMENTS PANEL ═══ */
+    .apt-panel{border-radius:20px;padding:32px;position:relative;overflow:hidden}
+    .apt-panel-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+    .apt-panel-title{font-size:20px;font-weight:800}
+    .apt-list{display:flex;flex-direction:column;gap:10px}
+    .apt-item{display:flex;align-items:center;gap:14px;padding:14px 18px;border-radius:14px;background:var(--surface);border:1px solid var(--border);transition:all .25s}
+    .apt-item:hover{border-color:var(--green);background:var(--green-g);transform:translateX(4px)}
+    .apt-dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);flex-shrink:0}
+    .apt-info{flex:1;min-width:0}
+    .apt-service{font-size:15px;font-weight:700}
+    .apt-time{font-size:13px;color:var(--text2);margin-top:2px;font-family:var(--mono)}
+    .apt-empty{text-align:center;padding:40px 0;color:var(--text2);font-size:15px}
+
+    /* ═══ KEY PROMPT ═══ */
+    .key-prompt{border-radius:14px;padding:20px;margin-bottom:20px;border:1px solid rgba(210,153,34,.3);background:rgba(210,153,34,.06)}
+    .key-prompt strong{color:#d29922}
+    .key-input-row{display:flex;gap:10px;margin-top:12px}
+    .key-input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 14px;color:var(--text);font:inherit;font-size:14px;outline:none;transition:border-color .2s}
+    .key-input:focus{border-color:var(--green)}
+
+    /* ═══ QUICK ACTIONS ═══ */
+    .actions-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+    @media(max-width:500px){.actions-grid{grid-template-columns:repeat(2,1fr)}}
+    .action-card{display:flex;flex-direction:column;align-items:center;gap:10px;padding:24px 16px;border-radius:16px;text-decoration:none;color:var(--text);font-size:14px;font-weight:600;text-align:center;transition:all .35s cubic-bezier(.34,1.56,.64,1);position:relative;overflow:hidden}
+    .action-card:hover{transform:translateY(-4px) scale(1.02);border-color:var(--border-h)}
+    .action-card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,var(--indigo-g),transparent);opacity:0;transition:opacity .3s}
+    .action-card:hover::before{opacity:1}
+    .action-icon{font-size:28px;position:relative;z-index:1}
+    .action-card span{position:relative;z-index:1}
+
+    /* ═══ FOOTER ═══ */
+    footer{border-top:1px solid var(--border);padding:32px 24px;text-align:center;font-size:14px;color:var(--text3)}
+    footer a{color:var(--text2);text-decoration:none;font-weight:600;transition:color .2s}
+    footer a:hover{color:var(--green)}
+
+    /* ═══ ANIMATIONS ═══ */
+    @keyframes fadeSlideUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+    @keyframes scaleIn{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
+    .reveal{opacity:0;transform:translateY(30px);transition:all .7s cubic-bezier(.22,1,.36,1)}
+    .reveal.visible{opacity:1;transform:translateY(0)}
+    .reveal-delay-1{transition-delay:.1s}
+    .reveal-delay-2{transition-delay:.2s}
+    .reveal-delay-3{transition-delay:.3s}
+    .reveal-delay-4{transition-delay:.4s}
+
+    /* ═══ LOADING ═══ */
+    .spinner{width:24px;height:24px;border:2.5px solid var(--border);border-top-color:var(--green);border-radius:50%;animation:spin .7s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+
+    /* ═══ RESPONSIVE ═══ */
+    @media(max-width:768px){
+      .hero{min-height:auto;padding:120px 20px 60px}
+      .hero h1{font-size:36px}
+      .status-bar{flex-direction:column;gap:12px;padding:16px}
+      .status-divider{width:40px;height:1px}
+      .bento{grid-template-columns:1fr}
+      .bento-wide{grid-column:span 1}
+      .actions-grid{grid-template-columns:repeat(2,1fr)}
+      nav{padding:0 16px}
+      .nav-link{padding:8px 12px;font-size:13px}
     }
-    .brand { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 700; color: var(--green); text-decoration: none; }
-    .nav-actions { display: flex; gap: 10px; }
-    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; text-decoration: none; border: none; transition: .15s; }
-    .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
-    .btn-outline:hover { border-color: var(--green); color: var(--green); }
-    .btn-green { background: var(--green); color: #000; }
-    .btn-green:hover { background: var(--green-dark); }
-
-    /* HERO */
-    .hero { text-align: center; padding: 80px 24px 40px; }
-    .hero-badge { display: inline-flex; align-items: center; gap: 6px; background: rgba(37,211,102,.12); color: var(--green); border: 1px solid rgba(37,211,102,.25); border-radius: 99px; padding: 5px 14px; font-size: 13px; font-weight: 600; margin-bottom: 24px; }
-    .hero h1 { font-size: clamp(32px,6vw,60px); font-weight: 800; line-height: 1.1; margin-bottom: 16px; }
-    .hero h1 span { color: var(--green); }
-    .hero p { font-size: 18px; color: var(--muted); max-width: 560px; margin: 0 auto 32px; line-height: 1.6; }
-
-    /* STATUS BAR */
-    .status-bar {
-      display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
-      gap: 16px; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 12px; padding: 14px 24px; max-width: 800px; margin: 0 auto 48px;
-    }
-    .status-item { display: flex; align-items: center; gap: 8px; font-size: 14px; }
-    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; }
-    .badge-green { background: rgba(37,211,102,.15); color: var(--green); }
-    .badge-red { background: rgba(248,81,73,.15); color: var(--red); }
-    .badge-yellow { background: rgba(210,153,34,.15); color: var(--yellow); }
-    .badge-blue { background: rgba(88,166,255,.15); color: var(--blue); }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-
-    /* MAIN LAYOUT */
-    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px 64px; }
-
-    /* STAT CARDS */
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 40px; }
-    .stat-card {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-      padding: 20px 24px; transition: border-color .2s;
-    }
-    .stat-card:hover { border-color: var(--green); }
-    .stat-icon { font-size: 28px; margin-bottom: 10px; }
-    .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; margin-bottom: 6px; }
-    .stat-value { font-size: 16px; font-weight: 700; color: var(--text); }
-    .stat-sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
-
-    /* TWO-COL LAYOUT */
-    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-    @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } }
-
-    .panel {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-      padding: 24px;
-    }
-    .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-    .panel-title { font-size: 15px; font-weight: 700; }
-
-    /* APPOINTMENTS */
-    .apt-list { display: flex; flex-direction: column; gap: 10px; }
-    .apt-item { display: flex; align-items: center; gap: 12px; background: var(--surface2); border-radius: 8px; padding: 12px 14px; }
-    .apt-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
-    .apt-info { flex: 1; min-width: 0; }
-    .apt-service { font-size: 14px; font-weight: 600; }
-    .apt-time { font-size: 12px; color: var(--muted); margin-top: 2px; }
-    .apt-empty { font-size: 14px; color: var(--muted); text-align: center; padding: 24px 0; }
-
-    /* QUICK ACTIONS */
-    .actions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .action-card {
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      gap: 8px; background: var(--surface2); border: 1px solid var(--border);
-      border-radius: 10px; padding: 20px 12px; text-decoration: none; color: var(--text);
-      font-size: 13px; font-weight: 600; text-align: center; transition: .15s; cursor: pointer;
-    }
-    .action-card:hover { border-color: var(--green); background: rgba(37,211,102,.06); color: var(--green); }
-    .action-icon { font-size: 24px; }
-
-    /* ADMIN KEY PROMPT */
-    .key-prompt { background: var(--surface2); border: 1px solid var(--yellow); border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; font-size: 14px; }
-    .key-prompt strong { color: var(--yellow); }
-    .key-input-row { display: flex; gap: 8px; margin-top: 10px; }
-    .key-input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 8px 12px; color: var(--text); font: inherit; font-size: 14px; outline: none; }
-    .key-input:focus { border-color: var(--green); }
-
-    /* FOOTER */
-    footer { border-top: 1px solid var(--border); padding: 24px; text-align: center; font-size: 13px; color: var(--muted); }
-    footer a { color: var(--green); text-decoration: none; }
-
-    /* LOADING SPINNER */
-    .spinner { width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--green); border-radius: 50%; animation: spin .7s linear infinite; margin: 24px auto; }
-    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
-  <nav>
-    <a class="brand" href="/"><span>💬</span> Clinic Chatbot</a>
-    <div class="nav-actions">
-      <a class="btn btn-outline" href="/chat/test">🧪 Test Chat</a>
-      <a class="btn btn-green" href="/admin">⚙️ Admin Panel</a>
-    </div>
-  </nav>
+  <div class="mesh-bg"></div>
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+  <div class="blob blob-3"></div>
+  <div class="particles" id="particles"></div>
 
-  <div class="hero">
-    <div class="hero-badge"><span class="dot"></span> Production</div>
-    <h1>WhatsApp AI <span>Clinic Bot</span></h1>
-    <p>Automated appointment booking, patient support, and seamless human handoff — powered by Groq LLaMA 3.3 70B.</p>
+  <div class="content">
+    <nav id="mainNav">
+      <a class="brand" href="/">
+        <div class="brand-icon">💬</div>
+        Clinic Chatbot
+      </a>
+      <div class="nav-links">
+        <a class="nav-link" href="/chat/test">Test Chat</a>
+        <a class="nav-link primary" href="/admin">Admin Panel</a>
+      </div>
+    </nav>
 
-    <div class="status-bar" id="statusBar">
-      <div class="status-item">
-        <span>🏥</span>
-        <strong id="clinicName">Loading…</strong>
+    <section class="hero">
+      <div class="hero-badge glass">
+        <span class="hero-badge-dot"></span>
+        Production Ready
       </div>
-      <div class="status-item">
-        <span>WhatsApp:</span>
-        <span class="badge badge-yellow" id="waBadge"><span class="dot"></span> checking…</span>
+      <h1>
+        WhatsApp AI<br/>
+        <span class="gradient-text">Clinic Assistant</span>
+      </h1>
+      <p>Automated appointment booking, patient support, and seamless human handoff — powered by Groq LLaMA 3.3 70B with RAG knowledge base.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="/chat/test">
+          <span>🧪</span> Try Demo Chat
+        </a>
+        <a class="btn btn-secondary" href="/admin">
+          <span>⚙️</span> Admin Dashboard
+        </a>
+        <a class="btn btn-secondary" href="/health">
+          <span>❤️</span> Health Check
+        </a>
       </div>
-      <div class="status-item">
-        <span>AI:</span>
-        <span class="badge badge-blue"><span class="dot"></span> Groq LLaMA 3.3</span>
-      </div>
-      <div class="status-item">
-        <span>Uptime:</span>
-        <span class="badge badge-green" id="uptimeBadge"><span class="dot"></span> online</span>
-      </div>
-    </div>
-  </div>
 
-  <div class="container">
-    <!-- Stat cards -->
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-icon">📱</div>
-        <div class="stat-label">WhatsApp Status</div>
-        <div class="stat-value" id="waStatusCard">Checking…</div>
-        <div class="stat-sub" id="waStatusSub">WhatsApp Business API</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🤖</div>
-        <div class="stat-label">AI Model</div>
-        <div class="stat-value">Groq LLaMA 3.3 70B</div>
-        <div class="stat-sub">llama-3.3-70b-versatile</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🚀</div>
-        <div class="stat-label">Deployment</div>
-        <div class="stat-value">Fly.io — ams</div>
-        <div class="stat-sub">Amsterdam region</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🔗</div>
-        <div class="stat-label">API Endpoint</div>
-        <div class="stat-value" id="apiEndpoint" style="font-size:13px;word-break:break-all;">—</div>
-        <div class="stat-sub">REST / Webhook</div>
-      </div>
-    </div>
-
-    <!-- Two-column -->
-    <div class="two-col">
-      <!-- Appointments -->
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">📅 Upcoming Appointments</span>
-          <button class="btn btn-outline" style="font-size:12px;padding:5px 10px;" onclick="loadAppointments()">Refresh</button>
+      <div class="status-bar glass" id="statusBar">
+        <div class="status-item">
+          <span class="status-label">🏥</span>
+          <strong class="status-value" id="clinicName">Loading…</strong>
         </div>
-        <div id="keyPrompt" class="key-prompt" style="display:none">
-          <strong>⚠️ Admin key required</strong> to view appointments.
-          <div class="key-input-row">
-            <input class="key-input" id="keyInput" type="password" placeholder="Enter ADMIN_API_KEY…" />
-            <button class="btn btn-green" style="font-size:13px;padding:8px 14px;" onclick="saveKey()">Save</button>
+        <div class="status-divider"></div>
+        <div class="status-item">
+          <span class="status-label">WhatsApp:</span>
+          <span class="badge badge-yellow" id="waBadge"><span class="badge-dot"></span> checking…</span>
+        </div>
+        <div class="status-divider"></div>
+        <div class="status-item">
+          <span class="status-label">AI:</span>
+          <span class="badge badge-blue"><span class="badge-dot"></span> Groq LLaMA 3.3</span>
+        </div>
+        <div class="status-divider"></div>
+        <div class="status-item">
+          <span class="status-label">Uptime:</span>
+          <span class="badge badge-green" id="uptimeBadge"><span class="badge-dot"></span> online</span>
+        </div>
+      </div>
+
+      <div class="scroll-indicator">
+        <div class="scroll-mouse"></div>
+        <span>Scroll</span>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header reveal">
+        <div class="section-label">System Overview</div>
+        <h2 class="section-title">Built for Scale</h2>
+        <p class="section-desc">Every component designed for reliability, speed, and intelligent patient interactions.</p>
+      </div>
+      <div class="bento">
+        <div class="bento-card glass reveal reveal-delay-1" data-tilt>
+          <div class="bento-icon" style="background:linear-gradient(135deg,rgba(34,197,94,.15),rgba(34,197,94,.05))">📱</div>
+          <h3>WhatsApp Status</h3>
+          <div class="counter-value" id="waStatusCard" style="color:var(--green)">—</div>
+          <p id="waStatusSub" style="font-size:13px">WhatsApp Business API</p>
+        </div>
+        <div class="bento-card glass reveal reveal-delay-2" data-tilt>
+          <div class="bento-icon" style="background:linear-gradient(135deg,rgba(99,102,241,.15),rgba(99,102,241,.05))">🤖</div>
+          <h3>AI Model</h3>
+          <div class="counter-value" style="color:var(--indigo);font-size:28px">LLaMA 3.3</div>
+          <p style="font-size:13px">70B parameters · Groq</p>
+        </div>
+        <div class="bento-card glass reveal reveal-delay-3" data-tilt>
+          <div class="bento-icon" style="background:linear-gradient(135deg,rgba(6,182,212,.15),rgba(6,182,212,.05))">🚀</div>
+          <h3>Deployment</h3>
+          <div class="counter-value" style="color:var(--cyan);font-size:28px">Fly.io</div>
+          <p style="font-size:13px">Amsterdam region</p>
+        </div>
+        <div class="bento-card glass reveal reveal-delay-4" data-tilt>
+          <div class="bento-icon" style="background:linear-gradient(135deg,rgba(168,85,247,.15),rgba(168,85,247,.05))">🔗</div>
+          <h3>API Endpoint</h3>
+          <div class="counter-value" id="apiEndpoint" style="font-size:16px;color:var(--purple);font-family:var(--mono)">—</div>
+          <p style="font-size:13px">REST / Webhook</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="bento" style="grid-template-columns:1.4fr 1fr">
+        <div class="bento-card glass apt-panel reveal" data-tilt>
+          <div class="apt-panel-header">
+            <span class="apt-panel-title">📅 Upcoming Appointments</span>
+            <button class="btn btn-secondary" style="font-size:13px;padding:8px 14px" onclick="loadAppointments()">↻ Refresh</button>
+          </div>
+          <div id="keyPrompt" class="key-prompt" style="display:none">
+            <strong>⚠️ Admin key required</strong> to view appointments.
+            <div class="key-input-row">
+              <input class="key-input" id="keyInput" type="password" placeholder="Enter ADMIN_API_KEY…" />
+              <button class="btn btn-primary" style="font-size:13px;padding:8px 16px" onclick="saveKey()">Save</button>
+            </div>
+          </div>
+          <div class="apt-list" id="aptList"><div class="spinner"></div></div>
+        </div>
+
+        <div class="bento-card glass reveal reveal-delay-2" data-tilt style="display:flex;flex-direction:column;justify-content:center">
+          <h3 style="font-size:18px;font-weight:800;margin-bottom:20px">⚡ Quick Actions</h3>
+          <div class="actions-grid">
+            <a class="action-card glass" href="/chat/test"><span class="action-icon">🧪</span><span>Test Chat</span></a>
+            <a class="action-card glass" href="/admin"><span class="action-icon">🎛️</span><span>Admin</span></a>
+            <a class="action-card glass" href="/admin#knowledge"><span class="action-icon">📚</span><span>Knowledge</span></a>
+            <a class="action-card glass" href="/admin#messages"><span class="action-icon">📨</span><span>Messages</span></a>
+            <a class="action-card glass" href="/admin#appointments"><span class="action-icon">📅</span><span>Appointments</span></a>
+            <a class="action-card glass" href="/admin#settings"><span class="action-icon">⚙️</span><span>Settings</span></a>
           </div>
         </div>
-        <div class="apt-list" id="aptList"><div class="spinner"></div></div>
       </div>
+    </section>
 
-      <!-- Quick actions -->
-      <div class="panel">
-        <div class="panel-header"><span class="panel-title">⚡ Quick Actions</span></div>
-        <div class="actions-grid">
-          <a class="action-card" href="/chat/test"><span class="action-icon">🧪</span>Test Chat</a>
-          <a class="action-card" href="/admin"><span class="action-icon">🎛️</span>Admin Panel</a>
-          <a class="action-card" href="/admin#knowledge"><span class="action-icon">📚</span>Knowledge Base</a>
-          <a class="action-card" href="/admin#messages"><span class="action-icon">📨</span>Send Message</a>
-          <a class="action-card" href="/admin#appointments"><span class="action-icon">📅</span>Appointments</a>
-          <a class="action-card" href="/admin#settings"><span class="action-icon">⚙️</span>Settings</a>
-        </div>
-      </div>
-    </div>
+    <footer class="reveal">
+      Powered by
+      <a href="https://groq.com" target="_blank">Groq</a> ·
+      <a href="https://fly.io" target="_blank">Fly.io</a> ·
+      <a href="https://github.com/whiskeysockets/baileys" target="_blank">Baileys</a> ·
+      <a href="https://hono.dev" target="_blank">Hono</a>
+    </footer>
   </div>
 
-  <footer>
-    Powered by <a href="https://groq.com" target="_blank">Groq</a> ·
-    <a href="https://fly.io" target="_blank">Fly.io</a> ·
-    <a href="https://github.com/whiskeysockets/baileys" target="_blank">Baileys</a> ·
-    <a href="https://hono.dev" target="_blank">Hono</a>
-  </footer>
-
   <script>
-    var adminKey = sessionStorage.getItem("adminKey");
+    (function(){
+      var c=document.getElementById('particles');if(!c)return;
+      for(var i=0;i<30;i++){
+        var p=document.createElement('div');p.className='particle';
+        p.style.left=Math.random()*100+'%';
+        p.style.animationDuration=(8+Math.random()*12)+'s';
+        p.style.animationDelay=Math.random()*10+'s';
+        p.style.width=p.style.height=(1+Math.random()*2)+'px';
+        c.appendChild(p);
+      }
+    })();
 
-    // Fetch health
-    fetch("/health").then(function(r){ return r.json(); }).then(function(d){
-      document.getElementById("clinicName").textContent = "Clinic Chatbot";
-      document.getElementById("apiEndpoint").textContent = location.origin;
-      var waReady = d.whatsappReady;
-      var badge = document.getElementById("waBadge");
-      var card = document.getElementById("waStatusCard");
-      var sub = document.getElementById("waStatusSub");
-      if (waReady) {
-        badge.className = "badge badge-green";
-        badge.innerHTML = '<span class="dot"></span> Online';
-        card.textContent = "Connected";
-        sub.textContent = "WhatsApp session active";
-      } else if (!d.whatsappEnabled) {
-        badge.className = "badge badge-yellow";
-        badge.innerHTML = '<span class="dot"></span> Disabled';
-        card.textContent = "Disabled";
-        sub.textContent = "WHATSAPP_ENABLED=false";
-      } else {
-        badge.className = "badge badge-red";
-        badge.innerHTML = '<span class="dot"></span> Offline';
-        card.textContent = "Not connected";
-        sub.textContent = "Scan QR to connect";
+    (function(){
+      var nav=document.getElementById('mainNav');
+      window.addEventListener('scroll',function(){nav.classList.toggle('scrolled',window.scrollY>40)},{passive:true});
+    })();
+
+    (function(){
+      var obs=new IntersectionObserver(function(entries){
+        entries.forEach(function(e){if(e.isIntersecting){e.target.classList.add('visible');obs.unobserve(e.target);}});
+      },{threshold:0.1,rootMargin:'0px 0px -40px 0px'});
+      document.querySelectorAll('.reveal').forEach(function(el){obs.observe(el);});
+    })();
+
+    (function(){
+      document.querySelectorAll('[data-tilt]').forEach(function(card){
+        card.addEventListener('mousemove',function(e){
+          var r=card.getBoundingClientRect();
+          var x=((e.clientX-r.left)/r.width-.5)*8;
+          var y=((e.clientY-r.top)/r.height-.5)*-8;
+          card.style.transform='perspective(800px) rotateY('+x+'deg) rotateX('+y+'deg) translateY(-4px)';
+          card.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');
+          card.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%');
+        });
+        card.addEventListener('mouseleave',function(){
+          card.style.transform='';card.style.setProperty('--mx','50%');card.style.setProperty('--my','50%');
+        });
+      });
+    })();
+
+    var _tz='Asia/Karachi';
+    fetch('/health').then(function(r){return r.json();}).then(function(d){
+      if(d.timezone)_tz=d.timezone;
+      document.getElementById('clinicName').textContent='Clinic Chatbot';
+      document.getElementById('apiEndpoint').textContent=location.origin;
+      var waReady=d.whatsappReady;
+      var badge=document.getElementById('waBadge');
+      var card=document.getElementById('waStatusCard');
+      var sub=document.getElementById('waStatusSub');
+      if(waReady){
+        badge.className='badge badge-green';badge.innerHTML='<span class="badge-dot"></span> Online';
+        card.textContent='Connected';sub.textContent='WhatsApp session active';
+      }else if(!d.whatsappEnabled){
+        badge.className='badge badge-yellow';badge.innerHTML='<span class="badge-dot"></span> Disabled';
+        card.textContent='Disabled';sub.textContent='WHATSAPP_ENABLED=false';
+      }else{
+        badge.className='badge badge-red';badge.innerHTML='<span class="badge-dot"></span> Offline';
+        card.textContent='Not connected';sub.textContent='Scan QR to connect';
       }
     }).catch(function(){
-      document.getElementById("uptimeBadge").className = "badge badge-red";
-      document.getElementById("uptimeBadge").innerHTML = '<span class="dot"></span> error';
+      document.getElementById('uptimeBadge').className='badge badge-red';
+      document.getElementById('uptimeBadge').innerHTML='<span class="badge-dot"></span> error';
     });
 
-    function loadAppointments() {
-      var key = sessionStorage.getItem("adminKey");
-      if (!key) {
-        document.getElementById("keyPrompt").style.display = "block";
-        document.getElementById("aptList").innerHTML = "";
-        return;
-      }
-      document.getElementById("keyPrompt").style.display = "none";
-      document.getElementById("aptList").innerHTML = '<div class="spinner"></div>';
-      fetch("/admin/appointments", { headers: { "x-admin-key": key } })
-        .then(function(r){ return r.json(); })
+    var adminKey=sessionStorage.getItem('adminKey');
+    function loadAppointments(){
+      var key=sessionStorage.getItem('adminKey');
+      if(!key){document.getElementById('keyPrompt').style.display='block';document.getElementById('aptList').innerHTML='';return;}
+      document.getElementById('keyPrompt').style.display='none';
+      document.getElementById('aptList').innerHTML='<div class="spinner"></div>';
+      fetch('/admin/appointments',{headers:{'x-admin-key':key}})
+        .then(function(r){return r.json();})
         .then(function(d){
-          var apts = d.appointments || [];
-          if (apts.length === 0) {
-            document.getElementById("aptList").innerHTML = '<p class="apt-empty">No upcoming appointments.</p>';
-            return;
-          }
-          var html = "";
+          var apts=d.appointments||[];
+          if(apts.length===0){document.getElementById('aptList').innerHTML='<p class="apt-empty">No upcoming appointments.</p>';return;}
+          var html='';
           apts.slice(0,8).forEach(function(a){
-            var dt = new Date(a.startsAt);
-            var dateStr = dt.toLocaleDateString(undefined, {weekday:"short",month:"short",day:"numeric"});
-            var timeStr = dt.toLocaleTimeString(undefined, {hour:"2-digit",minute:"2-digit"});
-            html += '<div class="apt-item"><div class="apt-dot"></div><div class="apt-info">'
-              + '<div class="apt-service">' + escHtml(a.service || "consultation") + '</div>'
-              + '<div class="apt-time">' + dateStr + " at " + timeStr + '</div>'
-              + '</div></div>';
+            var dt=new Date(a.startsAt);
+            var dateStr=dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',timeZone:_tz});
+            var timeStr=dt.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',timeZone:_tz});
+            html+='<div class="apt-item"><div class="apt-dot"></div><div class="apt-info">'
+              +'<div class="apt-service">'+escHtml(a.service||'consultation')+'</div>'
+              +'<div class="apt-time">'+dateStr+' at '+timeStr+'</div>'
+              +'</div></div>';
           });
-          document.getElementById("aptList").innerHTML = html;
+          document.getElementById('aptList').innerHTML=html;
         })
         .catch(function(e){
-          document.getElementById("aptList").innerHTML = '<p class="apt-empty" style="color:var(--red)">Failed to load: ' + escHtml(String(e)) + '</p>';
+          document.getElementById('aptList').innerHTML='<p class="apt-empty" style="color:#f85149">Failed to load: '+escHtml(String(e))+'</p>';
         });
     }
-
-    function saveKey() {
-      var val = document.getElementById("keyInput").value.trim();
-      if (!val) return;
-      sessionStorage.setItem("adminKey", val);
-      adminKey = val;
-      loadAppointments();
+    function saveKey(){
+      var val=document.getElementById('keyInput').value.trim();if(!val)return;
+      sessionStorage.setItem('adminKey',val);adminKey=val;loadAppointments();
     }
-
-    function escHtml(s) {
-      return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    }
-
+    function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
     loadAppointments();
-  </script>
-
-  <!-- ╔══════════════════════════════════════════════════════════════╗
-       ║        FLOATING CHATBOT WIDGET (BOTTOM-RIGHT POPUP)        ║
-       ╚══════════════════════════════════════════════════════════════╝ -->
-  <style>
-    /* ─── LAUNCHER BUTTON ───────────────────────────────────────────────── */
-    #cw-launcher {
-      position:fixed;bottom:24px;right:24px;z-index:9999;
-      width:60px;height:60px;border-radius:50%;
-      background:linear-gradient(135deg,#6366f1,#8b5cf6);
-      border:none;cursor:pointer;
-      display:flex;align-items:center;justify-content:center;
-      box-shadow:0 6px 28px rgba(99,102,241,.55);transition:transform .2s;
-    }
-    #cw-launcher:hover{transform:scale(1.1)}
-    #cw-launcher svg{width:26px;height:26px;fill:#fff;transition:opacity .2s}
-    #cw-launcher .cw-icon-close{display:none}
-    #cw-launcher.open .cw-icon-chat{display:none}
-    #cw-launcher.open .cw-icon-close{display:block}
-    /* notification badge */
-    #cw-badge{
-      position:absolute;top:-3px;right:-3px;
-      width:20px;height:20px;border-radius:50%;
-      background:#ef4444;color:#fff;font-size:11px;font-weight:700;
-      display:flex;align-items:center;justify-content:center;
-      border:2px solid var(--bg);animation:cwPulse 2s infinite;
-    }
-    @keyframes cwPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
-
-    /* ─── CHAT PANEL ───────────────────────────────────────────────────── */
-    /* Use display:none as the primary show/hide — reliable in all browsers.
-       The animation is a progressive enhancement via .cw-open-anim class. */
-    #cw-panel{
-      display:none;   /* HIDDEN by default — toggled to flex by cwToggle() */
-      position:fixed;bottom:96px;right:24px;z-index:9998;
-      width:390px;height:580px;
-      background:#1a1d2e;border-radius:20px;
-      box-shadow:0 24px 80px rgba(0,0,0,.7),0 0 0 1px rgba(99,102,241,.2);
-      flex-direction:column;overflow:hidden;
-    }
-    /* Panel is shown by setting display:flex via JS, then animation class plays */
-    #cw-panel.cw-open-anim{
-      animation:cwSlideIn .25s cubic-bezier(.34,1.56,.64,1) both;
-    }
-    @keyframes cwSlideIn{
-      from{transform:translateY(20px) scale(.95);opacity:0}
-      to{transform:translateY(0) scale(1);opacity:1}
-    }
-    @media(max-width:480px){
-      #cw-panel{right:0;bottom:0;width:100%;height:100dvh;border-radius:0;border-radius:0}
-      #cw-launcher{bottom:16px;right:16px}
-    }
-
-    /* Header */
-    #cw-panel .cp-hdr{
-      background:linear-gradient(175deg,#2e2a55,#1e1b40);
-      padding:14px 16px;display:flex;align-items:center;gap:11px;
-      flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.06);
-    }
-    .cp-av{
-      width:44px;height:44px;border-radius:12px;flex-shrink:0;
-      background:linear-gradient(135deg,#8b5cf6,#6366f1,#3b82f6);
-      display:flex;align-items:center;justify-content:center;
-      font-size:22px;box-shadow:0 3px 12px rgba(99,102,241,.4);
-    }
-    .cp-nm{color:#fff;font-size:15px;font-weight:700}
-    .cp-st{display:flex;align-items:center;gap:5px;margin-top:2px}
-    .cp-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e}
-    .cp-stxt{font-size:12px;color:#22c55e;font-weight:500}
-    .cp-hdr-btns{margin-left:auto;display:flex;gap:6px}
-    .cp-hbtn{
-      width:30px;height:30px;border:none;border-radius:8px;
-      background:rgba(255,255,255,.08);color:rgba(255,255,255,.6);
-      cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;
-      transition:background .15s;
-    }
-    .cp-hbtn:hover{background:rgba(255,255,255,.16);color:#fff}
-
-    /* Messages */
-    #cw-msgs{
-      flex:1;overflow-y:auto;padding:14px 14px 6px;
-      display:flex;flex-direction:column;gap:2px;
-      scrollbar-width:thin;scrollbar-color:rgba(99,102,241,.2) transparent;
-    }
-    #cw-msgs::-webkit-scrollbar{width:3px}
-    #cw-msgs::-webkit-scrollbar-thumb{background:rgba(99,102,241,.25);border-radius:2px}
-    .cw-row{display:flex;flex-direction:column;margin-bottom:2px}
-    .cw-row.bot{align-items:flex-start}.cw-row.usr{align-items:flex-end}
-    .cw-bbl{max-width:82%;padding:11px 15px;font-size:13.5px;line-height:1.55;word-break:break-word}
-    .cw-bbl.bot{background:#252a42;color:#dde1f0;border-radius:18px 18px 18px 5px}
-    .cw-bbl.usr{background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border-radius:18px 18px 5px 18px}
-    .cw-bbl.sys{background:rgba(255,255,255,.04);color:rgba(255,255,255,.35);font-size:11px;border-radius:8px;text-align:center;max-width:100%;padding:5px 10px}
-    .cw-time{font-size:10px;color:rgba(255,255,255,.22);margin-top:3px;padding:0 3px}
-    /* Booking card */
-    .cw-card{max-width:82%;border:1px solid rgba(34,197,94,.22);border-radius:14px;overflow:hidden;background:rgba(34,197,94,.06)}
-    .cw-card-hd{background:rgba(34,197,94,.14);padding:7px 13px;font-size:11px;font-weight:700;color:#4ade80;letter-spacing:.05em}
-    .cw-card-bd{padding:10px 13px;font-size:13px;color:#dde1f0;line-height:1.5}
-    .cw-card-id{padding:2px 13px 8px;font-size:10px;color:rgba(255,255,255,.2)}
-    /* Typing */
-    .cw-typing-row{display:flex}
-    .cw-tbbl{background:#252a42;border-radius:18px 18px 18px 5px;padding:12px 15px;display:inline-flex;gap:5px;align-items:center}
-    .cw-td{width:6px;height:6px;background:#6366f1;border-radius:50%;animation:cwTd 1.2s ease-in-out infinite both}
-    .cw-td:nth-child(2){animation-delay:.2s}.cw-td:nth-child(3){animation-delay:.4s}
-    @keyframes cwTd{0%,60%,100%{transform:translateY(0);opacity:.3}30%{transform:translateY(-7px);opacity:1}}
-    /* Handoff */
-    .cw-handoff{border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.07);color:#fbbf24;border-radius:10px;padding:7px 12px;font-size:12px;text-align:center}
-    /* Day sep */
-    .cw-daysep{text-align:center;padding:8px 0}
-    .cw-daysep span{font-size:11px;color:rgba(255,255,255,.18);background:rgba(255,255,255,.04);padding:3px 10px;border-radius:8px}
-
-    /* Suggestions */
-    #cw-sugg{display:none;flex-wrap:wrap;gap:7px;padding:10px 14px;flex-shrink:0}
-    .cw-chip{
-      border:1px solid rgba(99,102,241,.32);background:rgba(99,102,241,.07);
-      color:#a5b4fc;border-radius:20px;padding:6px 14px;font-size:12.5px;
-      cursor:pointer;font-family:inherit;transition:all .15s;line-height:1.3;
-    }
-    .cw-chip:hover{background:rgba(99,102,241,.2);border-color:#6366f1;color:#fff}
-
-    /* Input */
-    #cw-panel .cp-ibar{padding:10px 14px 14px;flex-shrink:0}
-    .cp-iwrap{
-      display:flex;align-items:center;background:#252a42;
-      border-radius:26px;border:1.5px solid rgba(99,102,241,.15);
-      padding:5px 5px 5px 16px;gap:8px;transition:border-color .2s;
-    }
-    .cp-iwrap:focus-within{border-color:rgba(99,102,241,.55);box-shadow:0 0 0 3px rgba(99,102,241,.07)}
-    #cw-inp{
-      flex:1;background:transparent;border:none;color:#dde1f0;
-      font-size:14px;font-family:inherit;outline:none;resize:none;
-      max-height:90px;line-height:1.5;padding:5px 0;
-    }
-    #cw-inp::placeholder{color:rgba(255,255,255,.25)}
-    #cw-send{
-      width:38px;height:38px;border-radius:50%;
-      background:linear-gradient(135deg,#6366f1,#8b5cf6);
-      border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;
-      flex-shrink:0;box-shadow:0 3px 10px rgba(99,102,241,.4);
-      transition:transform .15s,opacity .15s;
-    }
-    #cw-send:hover{transform:scale(1.08)}
-    #cw-send:disabled{opacity:.4;cursor:not-allowed;transform:none}
-    #cw-send svg{width:16px;height:16px;fill:#fff}
-  </style>
-
-  <!-- Launcher button -->
-  <button id="cw-launcher" onclick="cwToggle()" aria-label="Open chat">
-    <svg class="cw-icon-chat" viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z"/></svg>
-    <svg class="cw-icon-close" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-    <span id="cw-badge">1</span>
-  </button>
-
-  <!-- Chat panel -->
-  <div id="cw-panel" role="dialog" aria-label="Demo Clinic AI Chat">
-    <!-- Header -->
-    <div class="cp-hdr">
-      <div class="cp-av">🏥</div>
-      <div style="flex:1;min-width:0">
-        <div class="cp-nm">Demo Clinic AI</div>
-        <div class="cp-st"><span class="cp-dot" id="cw-dot"></span><span class="cp-stxt" id="cw-stxt">Online</span></div>
-      </div>
-      <div class="cp-hdr-btns">
-        <button class="cp-hbtn" onclick="cwClear()" title="Clear chat">&#128465;</button>
-        <button class="cp-hbtn" onclick="cwNewUser()" title="New user">🔄</button>
-        <button class="cp-hbtn" onclick="cwToggle()" title="Close">✕</button>
-      </div>
-    </div>
-    <!-- Messages -->
-    <div id="cw-msgs"></div>
-    <!-- Suggestions -->
-    <div id="cw-sugg"></div>
-    <!-- Input -->
-    <div class="cp-ibar">
-      <div class="cp-iwrap">
-        <textarea id="cw-inp" rows="1" placeholder="Ask me anything..." onkeydown="cwKey(event)" oninput="cwGrow(this)" style="width:100%"></textarea>
-        <button id="cw-send" onclick="cwSend()" title="Send">
-          <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-  (function(){
-    /* ─ CONFIG ────────────────────────────────────────────── */
-    // Wrap localStorage in try-catch — it throws in private/incognito mode
-    // on some browsers. If it fails, use in-memory state only.
-    var _lsGet = function(k){try{return localStorage.getItem(k);}catch(e){return null;}};
-    var _lsSet = function(k,v){try{localStorage.setItem(k,v);}catch(e){}};
-    var from = 'web_' + (_lsGet('cw_from') || (Date.now().toString(36)));
-    _lsSet('cw_from', from.replace('web_',''));
-    var userName = '';
-    var isOpen = false;
-    var isSending = false;
-    var abortCtrl = null;
-    var lastSendTime = 0;
-    var msgStore = [];
-    var SK = 'cw_msgs_v1_' + from;
-    var hasUnread = true;
-    var SUGGESTIONS = [
-      '👋 Hi! I need help',
-      '🗓\ufe0f Book an appointment',
-      '💰 Consultation fees',
-      '🧑\u200d⚕\ufe0f Services offered',
-      '📍 Clinic location',
-      '⏰ Opening hours',
-      '📝 My appointments',
-      '❌ Cancel appointment'
-    ];
-    var WELCOME = 'Good day! \ud83d\udc4b Welcome to **Demo Clinic AI**. I can help you with:\n\n\u2022 Book & manage appointments\n\u2022 Services & consultation fees\n\u2022 Doctors & clinic information\n\u2022 Opening hours & location\n\nHow can I assist you today?';
-
-    /* ─ HELPERS ──────────────────────────────────────── */
-    function now(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
-    function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');}
-    function scrollEnd(){var m=document.getElementById('cw-msgs');if(m)m.scrollTop=m.scrollHeight;}
-    // cwGrow and cwKey MUST be on window — called from inline oninput/onkeydown
-    window.cwGrow=function(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,90)+'px';};
-    function cwGrow(el){window.cwGrow(el);}
-    window.cwKey=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(window.cwSend)window.cwSend();}};
-    function cwKey(e){window.cwKey(e);}
-    function saveSK(){_lsSet(SK,JSON.stringify(msgStore.slice(-80)));}
-    function loadSK(){var s=_lsGet(SK);try{if(s)msgStore=JSON.parse(s);}catch(e){msgStore=[];}}
-
-    /* ─ HEALTH POLL ────────────────────────────────────── */
-    function pollHealth(){
-      fetch('/health').then(function(r){return r.json();}).then(function(d){
-        var dot=document.getElementById('cw-dot'),txt=document.getElementById('cw-stxt');
-        if(!dot)return;
-        var ok=d.whatsappReady;
-        txt.textContent=ok?'Online':'AI Mode';
-        txt.style.color=ok?'#22c55e':'#f59e0b';
-        dot.style.background=ok?'#22c55e':'#f59e0b';
-        dot.style.boxShadow='0 0 6px '+(ok?'#22c55e':'#f59e0b');
-      }).catch(function(){});
-    }
-    pollHealth();
-    setInterval(pollHealth,30000);
-
-    /* ─ TOGGLE ─────────────────────────────────────────── */
-    window.cwToggle=function(){
-      isOpen=!isOpen;
-      var panel=document.getElementById('cw-panel');
-      var launcher=document.getElementById('cw-launcher');
-      var badge=document.getElementById('cw-badge');
-      if(!panel||!launcher)return;
-      if(isOpen){
-        // Show: set display:flex then play slide-in animation
-        panel.style.display='flex';
-        panel.classList.add('cw-open-anim');
-        launcher.classList.add('open');
-        if(badge)badge.style.display='none';
-        hasUnread=false;
-        if(msgStore.length===0)cwInit();
-        setTimeout(function(){
-          var inp=document.getElementById('cw-inp');
-          if(inp)inp.focus();
-        },260);
-      } else {
-        // Hide: remove display
-        panel.style.display='none';
-        panel.classList.remove('cw-open-anim');
-        launcher.classList.remove('open');
-        if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
-      }
-    };
-
-    /* ─ INIT (first open) ─────────────────────────────────── */
-    function cwInit(){
-      loadSK();
-      var msgs=document.getElementById('cw-msgs');
-      msgs.innerHTML='<div class="cw-daysep"><span>Today</span></div>';
-      if(msgStore.length===0){
-        // Welcome message with typing delay for realism
-        cwShowTyping();
-        setTimeout(function(){
-          cwRemoveTyping();
-          cwRender('bot',WELCOME,'',now(),false);
-          cwShowSugg();
-        },900);
-      } else {
-        msgStore.forEach(function(m){cwRender(m.r,m.t,m.e||'',m.ts,false);});
-        cwHideSugg();
-      }
-      scrollEnd();
-    }
-
-    /* ─ RENDER MESSAGES ──────────────────────────────────── */
-    function cwRender(role,text,extra,time,save){
-      var el=document.getElementById('cw-msgs');
-      var row=document.createElement('div');
-      row.className='cw-row '+(role==='usr'?'usr':'bot');
-      if(role==='sys'){
-        row.innerHTML='<div class="cw-bbl sys">'+esc(text)+'</div>';
-      } else {
-        row.innerHTML='<div class="cw-bbl '+role+'">'+esc(text)+'</div>'
-          +'<div class="cw-time">'+(time||now())+'</div>';
-      }
-      el.appendChild(row);
-      if(save&&role!=='sys'){
-        msgStore.push({r:role,t:text,e:extra||'',ts:time||now()});
-        saveSK();
-      }
-      scrollEnd();
-    }
-    function cwAddBubble(r,t){cwRender(r,t,'',now(),true);}
-
-    function cwBookingCard(text,meta){
-      var el=document.getElementById('cw-msgs');
-      var row=document.createElement('div');
-      row.className='cw-row bot';
-      row.innerHTML='<div class="cw-card">'
-        +'<div class="cw-card-hd">✅ APPOINTMENT CONFIRMED</div>'
-        +'<div class="cw-card-bd">'+esc(text)+'</div>'
-        +(meta&&meta.appointmentId?'<div class="cw-card-id">ID: '+String(meta.appointmentId)+'</div>':'')
-        +'</div><div class="cw-time">'+now()+'</div>';
-      el.appendChild(row);
-      msgStore.push({r:'bot',t:text,e:'',ts:now()});
-      saveSK();scrollEnd();
-    }
-
-    /* ─ TYPING INDICATOR ──────────────────────────────────── */
-    function cwShowTyping(){
-      if(document.getElementById('cw-typing'))return;
-      var el=document.getElementById('cw-msgs');
-      var row=document.createElement('div');
-      row.className='cw-typing-row';row.id='cw-typing';
-      row.innerHTML='<div class="cw-tbbl"><div class="cw-td"></div><div class="cw-td"></div><div class="cw-td"></div></div>';
-      el.appendChild(row);scrollEnd();
-    }
-    function cwRemoveTyping(){var t=document.getElementById('cw-typing');if(t)t.remove();}
-
-    /* ─ SUGGESTIONS ────────────────────────────────────────── */
-    function cwShowSugg(){
-      var el=document.getElementById('cw-sugg');
-      el.innerHTML=SUGGESTIONS.map(function(s){
-        return '<button class="cw-chip" onclick="cwUseSugg(this.textContent)">'+s+'</button>';
-      }).join('');
-      el.style.display='flex';
-    }
-    function cwHideSugg(){document.getElementById('cw-sugg').style.display='none';}
-    window.cwUseSugg=function(t){
-      document.getElementById('cw-inp').value=t;
-      cwHideSugg();cwSend();
-    };
-
-    /* ─ CLEAR / NEW USER ────────────────────────────────────── */
-    window.cwClear=function(){
-      if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
-      isSending=false;cwRemoveTyping();
-      document.getElementById('cw-send').disabled=false;
-      msgStore=[];saveSK();
-      var msgs=document.getElementById('cw-msgs');
-      msgs.innerHTML='<div class="cw-daysep"><span>Today</span></div>';
-      cwRender('bot','Chat cleared! How can I help you today? \ud83d\ude0a','',now(),false);
-      cwShowSugg();
-    };
-    window.cwNewUser=function(){
-      if(abortCtrl){abortCtrl.abort();abortCtrl=null;}
-      isSending=false;cwRemoveTyping();
-      from='web_'+Date.now().toString(36);
-      _lsSet('cw_from',from.replace('web_',''));
-      userName='';
-      msgStore=[];
-      var msgs=document.getElementById('cw-msgs');
-      msgs.innerHTML='<div class="cw-daysep"><span>Today</span></div>';
-      cwShowTyping();
-      setTimeout(function(){
-        cwRemoveTyping();
-        cwRender('bot',WELCOME,'',now(),false);
-        cwShowSugg();
-      },800);
-    };
-
-    /* ─ SEND ───────────────────────────────────────────────── */
-    window.cwSend=async function(){
-      if(isSending)return;
-      var text=document.getElementById('cw-inp').value.trim();
-      if(!text)return;
-      // min gap to avoid rate-limit spike
-      var gap=Date.now()-lastSendTime;
-      if(gap<600)await new Promise(function(r){setTimeout(r,600-gap);});
-      isSending=true;lastSendTime=Date.now();
-      var btn=document.getElementById('cw-send');
-      btn.disabled=true;
-      cwHideSugg();
-      cwAddBubble('usr',text);
-      document.getElementById('cw-inp').value='';
-      document.getElementById('cw-inp').style.height='auto';
-      cwShowTyping();
-      abortCtrl=new AbortController();
-      try{
-        var r=await fetch('/chat/test',{
-          method:'POST',
-          headers:{'content-type':'application/json'},
-          body:JSON.stringify({from:from,name:userName||undefined,text:text}),
-          signal:abortCtrl.signal
-        });
-        abortCtrl=null;
-        cwRemoveTyping();
-        if(r.status===429){
-          cwAddBubble('sys','⚠️ Too many messages. Please wait a moment.');
-          setTimeout(function(){isSending=false;btn.disabled=false;},5000);
-          return;
-        }
-        var d=await r.json();
-        if(d.metadata&&d.metadata.booked&&d.text)cwBookingCard(d.text,d.metadata);
-        else if(d.text)cwAddBubble('bot',d.text);
-        if(d.handoff){
-          var hb=document.createElement('div');
-          hb.className='cw-handoff';hb.textContent='🔁 Connecting you to a human agent...';
-          document.getElementById('cw-msgs').appendChild(hb);scrollEnd();
-        }
-      }catch(e){
-        cwRemoveTyping();
-        if(e.name!=='AbortError')cwAddBubble('sys','⚠️ Connection error. Please retry.');
-      }
-      isSending=false;btn.disabled=false;
-      document.getElementById('cw-inp').focus();
-    };
-
-    // Auto-open after 3 seconds on first visit to grab attention
-    if(!_lsGet('cw_visited')){
-      setTimeout(function(){
-        if(!isOpen&&window.cwToggle)window.cwToggle();
-        _lsSet('cw_visited','1');
-      },3000);
-    }
-  })();
   </script>
 </body>
 </html>`;
 }
-
-// ── Admin dashboard SPA ───────────────────────────────────────────────────────
 
 function adminDashboardHtml(): string {
   return `<!doctype html>
@@ -1871,8 +1727,10 @@ function adminDashboardHtml(): string {
     var val = document.getElementById("modalKeyInput").value.trim();
     if (!val) return;
     var btn = document.getElementById("modalSaveBtn");
+    var errEl = document.getElementById("keyModalError");
     btn.disabled = true;
-    btn.textContent = "Verifying…";
+    btn.textContent = "Verifying\u2026";
+    errEl.style.display = "none";
     fetch("/admin/appointments", { headers: { "x-admin-key": val } })
       .then(function(r) {
         btn.disabled = false;
@@ -1881,24 +1739,32 @@ function adminDashboardHtml(): string {
           adminKey = val;
           sessionStorage.setItem("adminKey", val);
           document.getElementById("keyModal").classList.add("hidden");
-          document.getElementById("keyModalError").style.display = "none";
+          errEl.style.display = "none";
           updateKeyIndicator();
           loadDashboard();
           startAutoRefresh();
+        } else if (r.status === 503) {
+          errEl.style.display = "block";
+          errEl.textContent = "\u26a0\ufe0f ADMIN_API_KEY is not configured on the server. Set it in your .env file.";
+        } else if (r.status === 401) {
+          errEl.style.display = "block";
+          errEl.textContent = "\u274c Incorrect key \u2014 check your ADMIN_API_KEY in the .env file.";
         } else {
-          document.getElementById("keyModalError").style.display = "block";
+          errEl.style.display = "block";
+          errEl.textContent = "Server error (" + r.status + "). Is the server running?";
         }
       })
       .catch(function() {
         btn.disabled = false;
         btn.textContent = "Unlock Dashboard";
-        document.getElementById("keyModalError").style.display = "block";
-        document.getElementById("keyModalError").textContent = "Network error — is the server running?";
+        errEl.style.display = "block";
+        errEl.textContent = "\uD83D\uDCF5 Network error \u2014 is the server running on port 3000?";
       });
   }
 
   /* ── Tab switching ── */
   var tabLoaders = {
+    dashboard: loadDashboard,
     appointments: loadAppointmentsTab,
     knowledge: loadKnowledgeList,
     customers: loadCustomers,
@@ -1939,15 +1805,20 @@ function adminDashboardHtml(): string {
       if (el) el.innerHTML = "";
     }, 5000);
   }
+  var _biz_tz = "Asia/Karachi";
   function fmtDate(iso) {
-    if (!iso) return "—";
+    if (!iso) return "\u2014";
     var d = new Date(iso);
-    return d.toLocaleDateString(undefined, {weekday:"short",month:"short",day:"numeric"})
-      + " " + d.toLocaleTimeString(undefined, {hour:"2-digit",minute:"2-digit"});
+    return d.toLocaleDateString("en-US", {weekday:"short",month:"short",day:"numeric",timeZone:_biz_tz})
+      + " " + d.toLocaleTimeString("en-US", {hour:"2-digit",minute:"2-digit",timeZone:_biz_tz});
   }
 
   /* ── Dashboard ── */
   function loadDashboard() {
+    // Load business timezone first so appointment times display correctly
+    fetch("/health").then(function(r){return r.json();}).then(function(d){
+      if(d.timezone) _biz_tz = d.timezone;
+    }).catch(function(){});
     // Analytics stats
     apiGet("/admin/analytics").then(function(d) {
       if (!d.ok) return;
@@ -2053,8 +1924,12 @@ function adminDashboardHtml(): string {
   function sendToPatient(phone) {
     if (!phone) return;
     switchTab('messages');
-    document.getElementById('sendTo').value = phone;
-    document.getElementById('sendText').focus();
+    setTimeout(function() {
+      var inp = document.getElementById('sendTo');
+      if (inp) { inp.value = phone; inp.scrollIntoView({behavior:'smooth',block:'center'}); }
+      var txt = document.getElementById('sendText');
+      if (txt) txt.focus();
+    }, 80);
   }
 
   /* ── Knowledge tab ── */
@@ -2094,20 +1969,25 @@ function adminDashboardHtml(): string {
         el.innerHTML = '<div class="empty"><div class="empty-icon">📚</div>No knowledge entries yet. Add one above.</div>';
         return;
       }
-      var seen = {};
-      var rows = list.filter(function(e) {
-        // Show one row per unique title (might have multiple chunks)
-        var key = e.title;
-        if (seen[key]) return false;
-        seen[key] = true;
-        return true;
-      }).map(function(e) {
+      // Deduplicate by slug prefix (the part between businessId: and :chunkIndex)
+      var seenSlug = {};
+      var chunkCount = {};
+      list.forEach(function(e) {
         var slug = e.id.split(':').slice(1, -1).join(':') || e.id;
+        if (!seenSlug[slug]) { seenSlug[slug] = e; chunkCount[slug] = 0; }
+        chunkCount[slug]++;
+      });
+      var rows = Object.keys(seenSlug).map(function(slug) {
+        var e = seenSlug[slug];
+        // Strip " (N)" suffix from chunked titles for display
+        var displayTitle = e.title.replace(/\s*\(\d+\)$/, '');
+        var chunks = chunkCount[slug];
+        var chunkBadge = chunks > 1 ? ' <span class="badge" style="background:rgba(255,255,255,.07);color:var(--muted);font-size:10px">' + chunks + ' chunks</span>' : '';
         return '<tr>'
-          + '<td style="font-weight:600">' + escHtml(e.title) + '</td>'
+          + '<td style="font-weight:600">' + escHtml(displayTitle) + chunkBadge + '</td>'
           + '<td style="font-size:12px;color:var(--muted);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(e.content.slice(0,120)) + '…</td>'
           + '<td><span class="badge badge-blue">' + escHtml(e.source || 'manual') + '</span></td>'
-          + '<td><button class="btn btn-red btn-sm" onclick="deleteKnowledge(\'' + escHtml(slug) + '\',\'' + escHtml(e.title) + '\')">&#128465; Delete</button></td>'
+          + '<td><button class="btn btn-red btn-sm" onclick="deleteKnowledge(\'' + escHtml(slug) + '\',\'' + escHtml(displayTitle) + '\')">&#128465; Delete</button></td>'
           + '</tr>';
       }).join('');
       el.innerHTML = '<div class="table-wrap"><table>'
@@ -2268,9 +2148,19 @@ function adminDashboardHtml(): string {
   }
 
   function resetPrompt() {
-    if (!confirm('Reset system prompt to default? This will overwrite your current prompt.')) return;
-    document.getElementById('sPrompt').value = 'You are the friendly WhatsApp AI assistant for ' + (document.getElementById('sName').value || 'the clinic') + '. Be warm, natural, and brief — WhatsApp messages should be 2-3 sentences maximum. Reply in the customer\'s language. Match their exact tone and style. NEVER copy knowledge snippet text verbatim. For appointment queries, ALWAYS call get_my_appointments before responding. For new bookings, ask for date and time if missing, then call book_appointment. Never invent availability. For greetings, reply warmly by name — no tool calls needed.';
-    showAlert('settingsAlert', 'yellow', 'Default prompt loaded. Click Save Settings to apply.');
+    if (!confirm('Reset system prompt to the built-in default? This will overwrite your current custom prompt.')) return;
+    var clinicName = document.getElementById('sName').value.trim() || 'the clinic';
+    document.getElementById('sPrompt').value = [
+      'You are the friendly WhatsApp AI assistant for ' + clinicName + '.',
+      'Be warm, natural, and brief — WhatsApp messages should be 2-3 sentences maximum.',
+      'Reply in the customer\'s language. Match their exact tone and style.',
+      'NEVER copy knowledge snippet text verbatim.',
+      'For appointment queries, ALWAYS call get_my_appointments before responding.',
+      'For new bookings, ask for date and time if missing, then call book_appointment.',
+      'Never invent availability.',
+      'For greetings, reply warmly by name — no tool calls needed.'
+    ].join(' ');
+    showAlert('settingsAlert', 'yellow', '✏️ Default prompt loaded for "' + clinicName + '". Click Save Settings to apply.');
   }
 
   /* ── Auto-refresh ── */

@@ -31,7 +31,8 @@ const envSchema = z.object({
   BUSINESS_CLOSE_HOUR: z.coerce.number().int().min(1).max(24).default(18),
   APPOINTMENT_DURATION_MINUTES: z.coerce.number().int().positive().default(30),
   REMINDER_LEAD_MINUTES: z.coerce.number().int().positive().default(60),
-  HUMAN_HANDOFF_KEYWORDS: z.string().default("human,agent,representative,admin,owner")
+  HUMAN_HANDOFF_KEYWORDS: z.string().default("human,agent,representative,admin,owner"),
+  SENTRY_DSN: z.string().optional(),
 });
 
 export const config = envSchema.parse(process.env);
@@ -47,8 +48,16 @@ export const handoffKeywords = config.HUMAN_HANDOFF_KEYWORDS.split(",")
   .filter(Boolean);
 
 function loadDotEnv(path = ".env") {
+  if (
+    process.env.NODE_ENV === "test" ||
+    process.env.BUN_ENV === "test" ||
+    process.argv.some((arg) => arg === "test" || /\.test\.[cm]?[tj]s$/.test(arg))
+  ) {
+    return;
+  }
   if (!existsSync(path)) return;
   const content = readFileSync(path, "utf8");
+  if (/^\s*(NODE_ENV|BUN_ENV)\s*=\s*["']?test["']?\s*$/m.test(content)) return;
   for (const line of content.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;

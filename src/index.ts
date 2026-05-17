@@ -4,12 +4,15 @@ import { bootstrapDatabase } from "./db/bootstrap";
 import { createApp } from "./http/app";
 import { logger } from "./logger";
 import { initKnowledgeBase } from "./rag/knowledge-base";
+import { initSentry } from "./monitoring/sentry";
 import { startReminderWorker } from "./services/reminders";
 import { BaileysWhatsApp } from "./whatsapp/baileys";
 import { NullWhatsApp } from "./whatsapp/null-transport";
 
 async function main() {
   logger.info({ env: config.NODE_ENV, port: config.PORT }, "starting server");
+
+  initSentry();
 
   await bootstrapDatabase();
   await initKnowledgeBase();

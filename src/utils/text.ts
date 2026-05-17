@@ -5,7 +5,6 @@ const romanUrduKeywords = new Set([
   "kia",
   "hai",
   "hain",
-  "hai",
   "theek",
   "jazakallah",
   "han",

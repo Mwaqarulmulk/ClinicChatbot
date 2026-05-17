@@ -3,3 +3,7 @@ node_modules/
 dist/
 .env
 *.log
+.agents/
+.claude/
+skills-lock.json
+START.bat

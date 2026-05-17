@@ -1,7 +1,7 @@
 import { config, handoffKeywords } from "../config";
 import { db } from "../db/client";
 import { businesses } from "../db/schema";
-import { groq } from "./groq";
+import { groq, type GroqMessage, type GroqTool } from "./groq";
 import { executeTool, toolDefinitions } from "./tools";
 import { searchKnowledge, searchKnowledgeByTitle } from "../rag/knowledge-base";
 import {
@@ -22,16 +22,7 @@ import { detectLanguage, normalizePhone } from "../utils/text";
 import { formatLocal, parseLooseDateTime } from "../utils/time";
 import { eq } from "drizzle-orm";
 
-type ChatMessage = {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
-  tool_call_id?: string;
-  tool_calls?: Array<{
-    id: string;
-    type: "function";
-    function: { name: string; arguments: string };
-  }>;
-};
+type ChatMessage = GroqMessage;
 
 // Intent types for query analysis
 type QueryIntent = {
@@ -228,6 +219,102 @@ export async function handleInboundMessage(
     customerId: customer.id,
   });
 
+  // ── Cancellation confirmation fast-path ──────────────────────────────────
+  // When user says "yes/ok/han" after bot asked "shall I cancel?",
+  // cancel immediately without an AI round-trip that might loop.
+  const trimmedText = message.text.trim();
+  const isSimpleYes =
+    /^(yes|ok|sure|han|ji|haan|bilkul|theek|proceed|go ahead|do it|cancel it|cancel them all|yes cancel|yes please|please cancel|kar do|karo|karden|zaroor)[\s.!?]*$/i.test(
+      trimmedText,
+    );
+  if (isSimpleYes) {
+    const lastBot =
+      history.filter((h) => h.role === "assistant").at(-1)?.content ?? "";
+    const pendingCancel =
+      /cancel|shall i|would you like to cancel|cancel karna|appointment cancel|reschedule/i.test(
+        lastBot,
+      );
+    if (pendingCancel && customerAppointments.length > 0) {
+      const { cancelAppointment: doCancel } =
+        await import("../services/appointments");
+      let cancelledCount = 0;
+      for (const apt of customerAppointments) {
+        const r = await doCancel({
+          businessId: message.businessId,
+          customerId: customer.id,
+          startsAt: new Date(apt.startsAt),
+        });
+        if (r.ok) cancelledCount++;
+      }
+      const confirmText =
+        cancelledCount > 0
+          ? language === "roman_urdu" || language === "ur"
+            ? `Ho gaya! ${cancelledCount} appointment${cancelledCount > 1 ? "s" : ""} cancel ho gaye. Kya aur kuch chahiye? 😊`
+            : `Done! ${cancelledCount} appointment${cancelledCount > 1 ? "s" : ""} cancelled successfully. Is there anything else I can help you with? 😊`
+          : language === "roman_urdu" || language === "ur"
+            ? "Cancel nahi ho saka. Dobara try karein."
+            : "Could not find the appointment to cancel. Please try again.";
+      await appendMessage({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: confirmText,
+      });
+      if (cancelledCount > 0) {
+        await trackEvent({
+          businessId: message.businessId,
+          customerId: customer.id,
+          event: "message_replied",
+        });
+      }
+      return { text: confirmText };
+    }
+  }
+
+  // ── Cancel-all fast-path ─────────────────────────────────────────────────
+  // "cancel all my appointments" → cancel every upcoming appointment directly
+  const isCancelAll =
+    /cancel all|sab cancel|saari cancel|all appointments|cancel karo sab|cancel all appointments/i.test(
+      trimmedText,
+    );
+  if (isCancelAll && customerAppointments.length > 0) {
+    const { cancelAppointment: doCancel } =
+      await import("../services/appointments");
+    let cancelledCount = 0;
+    const labels: string[] = [];
+    for (const apt of customerAppointments) {
+      const r = await doCancel({
+        businessId: message.businessId,
+        customerId: customer.id,
+        startsAt: new Date(apt.startsAt),
+      });
+      if (r.ok) {
+        cancelledCount++;
+        labels.push(formatLocal(new Date(apt.startsAt), business.timezone));
+      }
+    }
+    const allCancelText =
+      cancelledCount > 0
+        ? language === "roman_urdu" || language === "ur"
+          ? `Done! Aap ke ${cancelledCount} appointment${cancelledCount > 1 ? "s" : ""} cancel ho gaye: ${labels.join(", ")}. Kya aur kuch chahiye? 😊`
+          : `Done! ${cancelledCount} appointment${cancelledCount > 1 ? "s" : ""} cancelled: ${labels.join(", ")}. Is there anything else I can help you with? 😊`
+        : language === "roman_urdu" || language === "ur"
+          ? "Koi upcoming appointment nahi mila."
+          : "No upcoming appointments found to cancel.";
+    await appendMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: allCancelText,
+    });
+    if (cancelledCount > 0) {
+      await trackEvent({
+        businessId: message.businessId,
+        customerId: customer.id,
+        event: "message_replied",
+      });
+    }
+    return { text: allCancelText };
+  }
+
   // Generate AI reply with full context
   logger.debug(
     { groqEnabled: !!groq, textPreview: message.text.substring(0, 20) },
@@ -249,7 +336,8 @@ export async function handleInboundMessage(
         knowledge,
         intent,
         customerAppointments: customerAppointments.map((a) => ({
-          startsAt: a.startsAt,
+          startsAt: formatLocal(new Date(a.startsAt), business.timezone),
+          startsAtIso: a.startsAt,
           service: a.service,
           status: a.status,
         })),
@@ -301,7 +389,8 @@ async function aiReply(input: {
   knowledge: Array<{ title: string; content: string; source?: string }>;
   intent: QueryIntent;
   customerAppointments: Array<{
-    startsAt: string;
+    startsAt: string; // human-readable local time for display
+    startsAtIso: string; // raw UTC ISO for cancel_appointment tool
     service: string;
     status: string;
   }>;
@@ -326,9 +415,12 @@ async function aiReply(input: {
   // Include appointment history for context
   const appointmentContext =
     input.customerAppointments.length > 0
-      ? `\nThis customer's appointment history:\n` +
+      ? `\nThis customer's upcoming appointments (times shown in local timezone ${input.business.timezone}):\n` +
         input.customerAppointments
-          .map((a) => `- ${a.startsAt}: ${a.service} (${a.status})`)
+          .map(
+            (a) =>
+              `- localTime="${a.startsAt}" startsAt="${a.startsAtIso}" service="${a.service}" status="${a.status}"`,
+          )
           .join("\n")
       : "\nThis is a new customer with no prior appointments.";
 
@@ -357,8 +449,9 @@ async function aiReply(input: {
         "4. 'What is my name' / 'tell me about me' / 'who am I': answer directly from the Customer Context above. Do NOT call any tools.",
         "5. 'My appointments' / 'my booking' / 'booking detail' / 'already booked': call get_my_appointments FIRST, then reply with the result. Do NOT ask for a date/time.",
         "6. Booking a new appointment: ask for date+time if not provided, then call book_appointment.",
-        "7. Cancellation: call get_my_appointments first to see what exists, then call cancel_appointment.",
+        "7. Cancellation — IMPORTANT: (a) Call get_my_appointments first. (b) Each appointment in the result has a 'startsAt' (raw ISO) and 'localTime' (display). Show 'localTime' to user. (c) To cancel, call cancel_appointment with the EXACT 'startsAt' ISO value — do NOT modify it. (d) After user says 'yes/ok/han/ji', call cancel_appointment IMMEDIATELY — do NOT ask again. (e) One user message = ONE confirmation check maximum.",
         "8. NEVER call handoff_to_human for ordinary questions. Only escalate when the customer explicitly demands a human, or for a serious unresolvable complaint.",
+        "9. Time display: ALWAYS show times from 'localTime' field (e.g. 'May 14, 2026, 10:00 AM'). NEVER show raw UTC ISO strings to users.",
         "",
         // ── CURRENT CONTEXT ─────────────────────────────────────────────────────────────────────
         `Language: ${input.language}. ${languageInstruction}`,
@@ -424,10 +517,14 @@ User: Do I have any appointments?
 (After calling get_my_appointments and finding none)
 Assistant: Aap ke abhi koi upcoming appointments nahi hain. Kya main aap ke liye ek book kar doon? 😊
 
-[Cancellation]
+[Cancellation — step 1]
 User: I want to cancel my appointment
-(After calling get_my_appointments first)
-Assistant: I can see you have an appointment on May 15 at 2:00 PM for Dental Care. Shall I go ahead and cancel it?
+(Call get_my_appointments → gets [{startsAt:"2026-05-14T05:00:00.000Z", localTime:"May 14, 2026, 10:00 AM", service:"consultation"}])
+Assistant: You have an appointment on May 14 at 10:00 AM for consultation. Shall I cancel it?
+
+[Cancellation — step 2 (user confirms)]
+User: yes
+Assistant: (call cancel_appointment({startsAt: "2026-05-14T05:00:00.000Z"}) — use EXACT startsAt, then reply:) Done! Your appointment has been cancelled. Is there anything else I can help with? ✅
 
 [What is my name / profile]
 User: What is my name?
@@ -466,8 +563,8 @@ KEY STYLE RULES:
         return await groq!.chat.completions.create({
           model: config.GROQ_MODEL,
           temperature: config.AI_TEMPERATURE,
-          messages: messages as never,
-          tools: toolDefinitions as never,
+          messages: messages,
+          tools: toolDefinitions as unknown as GroqTool[],
           tool_choice: "auto",
           max_completion_tokens: 800,
         });
@@ -815,6 +912,10 @@ async function tryDeterministicBooking(input: {
           ? input.language === "ur" || input.language === "roman_urdu"
             ? "Ye slot available nahi hai. Please koi aur time bhej dein."
             : "That slot is not available. Please send another time."
+          : result.reason === "past_datetime"
+            ? input.language === "ur" || input.language === "roman_urdu"
+              ? "Ye time guzar chuka hai. Please future ka date aur time bhej dein."
+              : "That time has already passed. Please send a future date and time."
           : input.language === "ur" || input.language === "roman_urdu"
             ? "Ye time business hours ke bahar hai. Please working hours mein koi time bhej dein."
             : "That time is outside business hours. Please choose a time during working hours.",

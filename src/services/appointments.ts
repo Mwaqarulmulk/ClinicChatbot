@@ -5,10 +5,24 @@ import { appointments, businesses } from "../db/schema";
 import { addMinutes, formatLocal, startOfZonedDay, zonedBusinessTime, zonedHourValue } from "../utils/time";
 import { createId } from "../utils/id";
 
+// Simple in-memory cache for business lookups (TTL 5 minutes)
+let businessCache = new Map<string, { data: typeof businesses.$inferSelect; expiresAt: number }>();
+const BUSINESS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 export async function getBusiness(businessId: string) {
+  const cached = businessCache.get(businessId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
   const business = await db.query.businesses.findFirst({ where: eq(businesses.id, businessId) });
   if (!business) throw new Error(`Business not found: ${businessId}`);
+  businessCache.set(businessId, { data: business, expiresAt: Date.now() + BUSINESS_CACHE_TTL });
   return business;
+}
+
+/** Clear the business cache (e.g. after updating settings) */
+export function clearBusinessCache() {
+  businessCache.clear();
 }
 
 export async function getAvailability(input: { businessId: string; date: Date }) {
@@ -52,6 +66,12 @@ export async function bookAppointment(input: {
 }) {
   const business = await getBusiness(input.businessId);
   const startsAt = new Date(input.startsAt);
+  if (Number.isNaN(startsAt.getTime())) {
+    return { ok: false as const, reason: "invalid_datetime" };
+  }
+  if (startsAt <= new Date()) {
+    return { ok: false as const, reason: "past_datetime" };
+  }
   const endsAt = addMinutes(startsAt, business.appointmentDurationMinutes);
   if (!isInsideBusinessHours(startsAt, business.timezone, business.openHour, business.closeHour)) {
     return { ok: false as const, reason: "outside_business_hours" };
@@ -80,7 +100,14 @@ export async function bookAppointment(input: {
     createdAt: now,
     updatedAt: now
   };
-  await db.insert(appointments).values(appointment);
+  try {
+    await db.insert(appointments).values(appointment);
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      return { ok: false as const, reason: "slot_unavailable" };
+    }
+    throw error;
+  }
   return {
     ok: true as const,
     appointment,
@@ -136,4 +163,14 @@ export async function cancelAppointment(input: { businessId: string; customerId:
 function isInsideBusinessHours(date: Date, timeZone: string, openHour: number, closeHour: number): boolean {
   const hour = zonedHourValue(date, timeZone);
   return hour >= openHour && hour < closeHour;
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "object" && error !== null && "message" in error
+        ? String((error as { message?: unknown }).message)
+        : "";
+  return /unique|constraint/i.test(message);
 }

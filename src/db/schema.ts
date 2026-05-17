@@ -1,4 +1,4 @@
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const businesses = sqliteTable("businesses", {
@@ -92,7 +92,10 @@ export const appointments = sqliteTable(
     updatedAt: text("updated_at").notNull()
   },
   (table) => ({
-    scheduleIdx: index("appointments_schedule_idx").on(table.businessId, table.startsAt, table.status)
+    scheduleIdx: index("appointments_schedule_idx").on(table.businessId, table.startsAt, table.status),
+    activeSlotIdx: uniqueIndex("appointments_active_slot_idx")
+      .on(table.businessId, table.startsAt)
+      .where(sql`status != 'cancelled'`)
   })
 );
 
@@ -122,4 +125,3 @@ export const customerRelations = relations(customers, ({ one, many }) => ({
   conversations: many(conversations),
   appointments: many(appointments)
 }));
-

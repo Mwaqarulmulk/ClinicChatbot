@@ -46,9 +46,11 @@ export class BaileysWhatsApp implements WhatsAppTransport {
     this.reconnecting = false;
     if (this.socket) {
       try {
-        await this.socket.logout();
+        // Use ws.close() to cleanly terminate the WebSocket without
+        // logging out — preserves the session for next startup.
+        this.socket.ws?.close();
       } catch {
-        // logout can fail if already disconnected; that's fine
+        // close can fail if already disconnected; that's fine
       }
       this.socket = null;
     }

@@ -4,7 +4,7 @@
 # native binaries — they will NOT load on Alpine (musl libc) and will crash
 # the process at startup.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM node:24-bookworm-slim
+FROM node:22-bookworm-slim AS base
 
 WORKDIR /app
 ENV NODE_ENV=production
@@ -27,6 +27,11 @@ COPY . .
 # On Fly.io: mounted at /app/data via fly.toml [[mounts]].
 # Locally:   app defaults to .data/ via config.ts defaults.
 RUN mkdir -p /app/data
+
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # Expose the HTTP port declared in fly.toml [env] PORT
 EXPOSE 8080
