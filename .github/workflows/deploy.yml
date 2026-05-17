@@ -5,7 +5,6 @@ on:
     branches:
       - main
 
-# Prevent concurrent deployments that could corrupt the volume
 concurrency:
   group: fly-deploy
   cancel-in-progress: false
@@ -16,43 +15,56 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      FLY_APP_NAME: clinicchatbot
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Verify fly.toml is present — it must NOT be in .gitignore
       - name: Verify fly.toml exists
         run: |
           if [ ! -f fly.toml ]; then
-            echo "::error::fly.toml is missing. Make sure it is committed and NOT in .gitignore."
+            echo "::error::fly.toml is missing. Commit fly.toml before deployment."
             exit 1
           fi
 
-      # Install dependencies so tsc can run
       - name: Install dependencies
         run: npm ci
 
-      # Catch TypeScript errors before they reach production
       - name: TypeScript type-check
         run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Apply Turso migrations when configured
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          if [ -n "$TURSO_DATABASE_URL" ] && [ -n "$TURSO_AUTH_TOKEN" ]; then
+            npm run db:migrate
+            npm run db:check
+          else
+            echo "Turso secrets not configured; skipping remote migration."
+          fi
 
       - name: Set up flyctl
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Deploy to Fly.io
-        run: flyctl deploy --remote-only --wait-timeout 180
+        run: flyctl deploy --remote-only --wait-timeout 300
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-      # Verify the app is actually responding after deployment
       - name: Post-deploy smoke test
         run: |
           echo "Waiting 15s for app to stabilise..."
           sleep 15
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://clinicchatbot.fly.dev/health)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${FLY_APP_NAME}.fly.dev/health")
           if [ "$STATUS" != "200" ]; then
-            echo "::error::Health check failed — /health returned HTTP $STATUS"
+            echo "::error::Health check failed: /health returned HTTP $STATUS"
             exit 1
           fi
-          echo "✅ Smoke test passed — /health returned 200"
+          echo "Smoke test passed: /health returned 200"

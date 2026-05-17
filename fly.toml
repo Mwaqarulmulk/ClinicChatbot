@@ -9,6 +9,11 @@ primary_region = 'ams'
 [build]
   dockerfile = 'Dockerfile'
 
+[deploy]
+  # Idempotent DB bootstrap before the new machine is promoted. Works with the
+  # default Fly volume SQLite database and remote Turso when secrets are set.
+  release_command = 'node --import tsx scripts/db-bootstrap.ts'
+
 # ── Non-secret environment variables ─────────────────────────────────────────
 # Secrets (GROQ_API_KEY, TURSO_AUTH_TOKEN, ADMIN_API_KEY, …) must be set via:
 #   fly secrets set KEY=value

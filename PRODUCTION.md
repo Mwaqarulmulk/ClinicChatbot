@@ -88,6 +88,8 @@ fly secrets set ADMIN_API_KEY=your-secure-random-key
 fly deploy
 ```
 
+The repository's `fly.toml` includes a release command that runs `scripts/db-bootstrap.ts` before the machine is promoted. This creates missing tables/indexes and the default business row without overwriting existing data.
+
 ### Step 5: Initialize Turso Schema
 
 Run these once from your local machine after `.env` contains the Turso URL/token, or run them in a trusted CI job with the same secrets:
@@ -165,6 +167,23 @@ fly ssh -C "cat /app/.data/baileys-auth/creds.json"
 ---
 
 ## Troubleshooting
+
+### GitHub Actions Deployment
+
+Set this repository secret before relying on automatic deploys from `main`:
+
+```text
+FLY_API_TOKEN
+```
+
+If you use remote Turso, also set:
+
+```text
+TURSO_DATABASE_URL
+TURSO_AUTH_TOKEN
+```
+
+The workflow runs `npm ci`, type-checks, runs tests, optionally applies Turso migrations when both Turso secrets are present, deploys with `flyctl deploy --remote-only`, then smoke-tests `/health`.
 
 ### WhatsApp Disconnects
 ```bash

@@ -207,6 +207,20 @@ fly deploy
 
 Keep `min_machines_running = 1` because WhatsApp WebSocket sessions should stay warm.
 
+On Windows, the maintained deployment helper is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy.ps1
+```
+
+For remote Turso deployment:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy.ps1 -UseTurso
+```
+
+`fly.toml` includes a Fly release command that runs `scripts/db-bootstrap.ts` before the new machine is promoted. That command is idempotent and works with either the default Fly volume SQLite database or remote Turso secrets.
+
 ### Turso Database
 
 Local development uses `file:.data/local.db` by default. For Turso cloud:
@@ -240,6 +254,8 @@ bun run db:check
 - [ ] Rotate all default/exposed API keys
 - [ ] Set `NODE_ENV=production`
 - [ ] Configure `ADMIN_API_KEY` with a strong secret
+- [ ] Set `FLY_API_TOKEN` in GitHub Actions secrets if using CI deployment
+- [ ] Set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in GitHub Actions secrets if using remote Turso migrations
 - [ ] Set up automated SQLite backups (cron or Fly.io snapshot)
 - [ ] Add error monitoring (Sentry, Datadog, or similar)
 - [ ] Configure HTTPS/TLS termination

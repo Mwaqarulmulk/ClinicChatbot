@@ -18,6 +18,9 @@ primary_region = "ams"    # nearest region: ams/lhr/sin/iad/ord/…
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  release_command = "node --import tsx scripts/db-bootstrap.ts"
+
 [env]
   NODE_ENV         = "production"
   PORT             = "8080"
