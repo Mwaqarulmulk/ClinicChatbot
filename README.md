@@ -62,10 +62,12 @@ See `docs/ARCHITECTURE.md` for the full production analysis, hidden methods, and
 bun install
 ```
 
-4. Push database schema:
+4. Apply the database schema:
 
 ```bash
-bun run db:push
+bun run db:migrate
+bun run db:bootstrap
+bun run db:check
 ```
 
 5. Seed example knowledge:
@@ -170,7 +172,11 @@ All `/admin/*` endpoints require `x-admin-key` header when `ADMIN_API_KEY` is co
 | `bun run build` | TypeScript type check |
 | `bun run typecheck` | TypeScript type check |
 | `bun run lint` | TypeScript type check |
-| `bun run db:push` | Push Drizzle schema to DB |
+| `bun run db:generate` | Generate a Drizzle SQL migration from schema changes |
+| `bun run db:migrate` | Apply committed Drizzle migrations to DB |
+| `bun run db:push` | Push Drizzle schema directly during local prototyping |
+| `bun run db:bootstrap` | Create missing tables and seed the default business |
+| `bun run db:check` | Verify DB connectivity, required tables, and indexes |
 | `bun run db:studio` | Open Drizzle Studio |
 | `bun run seed:knowledge` | Seed sample RAG knowledge |
 | `bun run docker:build` | Build Docker image |
@@ -200,6 +206,34 @@ fly deploy
 ```
 
 Keep `min_machines_running = 1` because WhatsApp WebSocket sessions should stay warm.
+
+### Turso Database
+
+Local development uses `file:.data/local.db` by default. For Turso cloud:
+
+```bash
+turso auth login
+turso db create clinic-chatbot
+turso db show clinic-chatbot --url
+turso db tokens create clinic-chatbot
+```
+
+Put the returned values in `.env` for local operations, or set them as Fly secrets:
+
+```bash
+TURSO_DATABASE_URL=libsql://your-database.turso.io
+TURSO_AUTH_TOKEN=your-token
+```
+
+Then initialize and verify the database:
+
+```bash
+bun run db:migrate
+bun run db:bootstrap
+bun run db:check
+```
+
+`db:migrate` uses committed SQL migrations in `drizzle/`. `drizzle.config.ts` loads `.env` automatically and refuses remote Turso URLs without `TURSO_AUTH_TOKEN`. `db:bootstrap` is safe to rerun; it creates missing tables/indexes and inserts the default business only if it does not exist.
 
 ### Production Checklist
 

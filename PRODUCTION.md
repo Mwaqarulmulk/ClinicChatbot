@@ -88,7 +88,19 @@ fly secrets set ADMIN_API_KEY=your-secure-random-key
 fly deploy
 ```
 
-### Step 5: Check Status
+### Step 5: Initialize Turso Schema
+
+Run these once from your local machine after `.env` contains the Turso URL/token, or run them in a trusted CI job with the same secrets:
+
+```bash
+bun run db:migrate
+bun run db:bootstrap
+bun run db:check
+```
+
+`db:migrate` applies the committed Drizzle SQL migrations. `db:bootstrap` creates any missing app tables/indexes and seeds the default business id. `db:check` verifies connectivity plus the required tables and indexes, including the active appointment slot uniqueness index.
+
+### Step 6: Check Status
 
 ```bash
 fly status
